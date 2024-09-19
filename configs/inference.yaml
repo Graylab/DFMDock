@@ -1,0 +1,20 @@
+data:
+  ckpt: ../checkpoints/dips/model_0.ckpt
+  dataset: db5_test
+  test_all: True
+  out_pdb: False
+  out_trj: False
+  get_gt_energy: False
+  ode: False
+  out_pdb_dir: ./pdbs/
+  out_trj_dir: ./trjs/
+  out_csv_dir: ./csv_files/
+  out_csv: db5_test_model_0.csv
+  num_steps: 40
+  num_samples: 1
+  tr_noise_scale: 0.5
+  rot_noise_scale: 0.5
+  perturb_tr: True
+  perturb_rot: True
+  use_esm: True
+  use_clash_force: False
