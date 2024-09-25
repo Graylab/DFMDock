@@ -1,13 +1,4 @@
 #!/bin/bash
-#SBATCH --nodes=1
-#SBATCH --ntasks-per-node=12
-#SBATCH --partition=a100,v100
-#SBATCH --gres=gpu:1
-#SBATCH --account=jgray21_gpu
-#SBATCH --time=24:00:00
-#SBATCH --qos=qos_gpu
-#SBATCH --output=slogs/%j.out
-#SBATCH --exclude=gpu[04,09]
 
 # Set default values
 DIR=$(pwd)

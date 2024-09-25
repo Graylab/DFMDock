@@ -165,3 +165,4 @@ slogs/
 outputs/
 *.pdb
 *.csv
+inference_gpu.sh
