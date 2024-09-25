@@ -5,6 +5,7 @@ import torch
 import torch.nn.functional as F
 import pytorch_lightning as pl
 import warnings
+from pathlib import Path
 from tqdm import tqdm
 from typing import Optional
 from torch.utils.data import DataLoader, Dataset
@@ -235,46 +236,12 @@ class PPIDataset(Dataset):
         self.use_esm = use_esm
         self.crop_size = crop_size
 
-        if dataset == 'dips_train_0.3_rep':
-            self.data_dir = "/scratch4/jgray21/lchu11/data/pt/dips_bb"
-            self.data_list = "/scratch4/jgray21/lchu11/data/dips/data_list/geodock/train_0.3_rep.txt" 
+        parent_dir = Path(__file__).resolve().parents[2]
 
-        elif dataset == 'dips_val_0.3_rep':
-            self.data_dir = "/scratch4/jgray21/lchu11/data/pt/dips_bb"
-            self.data_list = "/scratch4/jgray21/lchu11/data/dips/data_list/geodock/val_0.3_rep.txt" 
-
-        elif dataset == 'dips_train':
-            self.data_dir = "/scratch4/jgray21/lchu11/data/pt/dips_bb"
-            self.data_list = "/scratch4/jgray21/lchu11/data/dips/data_list/geodock/train.txt" 
-
-        elif dataset == 'dips_val':
-            self.data_dir = "/scratch4/jgray21/lchu11/data/pt/dips_bb"
-            self.data_list = "/scratch4/jgray21/lchu11/data/dips/data_list/geodock/val.txt" 
-
-        elif dataset == 'dips_train_hetero':
-            self.data_dir = "/scratch4/jgray21/lchu11/data/pt/dips_bb"
-            self.data_list = "/scratch4/jgray21/lchu11/graylab_repos/Dock_Diffusion/src/data/txt_files/dips_train_hetero.txt" 
-
-        elif dataset == 'dips_val_hetero':
-            self.data_dir = "/scratch4/jgray21/lchu11/data/pt/dips_bb"
-            self.data_list = "/scratch4/jgray21/lchu11/graylab_repos/Dock_Diffusion/src/data/txt_files/dips_val_hetero.txt" 
-
-        elif dataset == 'dips_test':
-            self.data_dir = "/scratch4/jgray21/lchu11/data/pt/dips_test"
-            self.data_list = "/scratch4/jgray21/lchu11/data/dips/data_list/geodock/test.txt" 
-
-        elif dataset == 'db5_test':
-            self.data_dir = "/scratch4/jgray21/lchu11/data/pt/db5_bound"
-            self.data_list = "/scratch4/jgray21/lchu11/data/db5/test_bound.txt"
+        if dataset == 'db5_test':
+            self.data_dir = f"{parent_dir}/data/db5_test"
+            self.data_list = f"{parent_dir}/data/db5_test/test.txt"
             
-        elif dataset == 'db5_bound':
-            self.data_dir = "/scratch4/jgray21/lchu11/data/pt/db5_bound"
-            self.data_list = "/scratch4/jgray21/lchu11/data/db5/bound.txt"
-
-        elif dataset == 'ab_ag':
-            self.data_dir = "/scratch4/jgray21/lchu11/data/pt/ab_ag"
-            self.data_list = "/scratch4/jgray21/lchu11/data/ab_ag/Yin/af2.3_benchmark/test.txt"
-
         with open(self.data_list, 'r') as f:
             lines = f.readlines()
         self.file_list = [line.strip() for line in lines] 
@@ -396,3 +363,7 @@ class PPIDataset(Dataset):
         lig_pos = pos[sep:]
 
         return rec_x, lig_x, rec_pos, lig_pos, res_id, asym_id
+
+
+if __name__ == '__main__':
+    dataset = PPIDataset(dataset='db5_test')

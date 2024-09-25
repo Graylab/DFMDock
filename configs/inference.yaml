@@ -1,7 +1,7 @@
 data:
-  ckpt: ../checkpoints/dips/model_0.ckpt
+  ckpt: ./checkpoints/dips/model_0.ckpt
   dataset: db5_test
-  test_all: True
+  test_all: False
   out_pdb: False
   out_trj: False
   get_gt_energy: False
