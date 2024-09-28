@@ -19,6 +19,7 @@ from models.score_model import Score_Model
 
 #----------------------------------------------------------------------------
 # output functions
+
 def save_pdb(output, out_pdb):
     if os.path.exists(out_pdb):
         os.remove(out_pdb)
@@ -285,6 +286,26 @@ def get_full_coords(coords):
         [N, CA, C, O, CB], dim=1)
     
     return full_coords
+
+def get_clash_force(rec_pos, lig_pos):
+    rec_pos = rec_pos.view(-1, 3)
+    lig_pos = lig_pos.view(-1, 3)
+
+    with torch.set_grad_enabled(True):
+        lig_pos.requires_grad_(True)
+        # get distance matrix 
+        D = torch.norm((rec_pos[:, None, :] - lig_pos[None, :, :]), dim=-1)
+
+        def rep_fn(x):
+            x0, p, w_rep = 4, 1.5, 5
+            rep = torch.where(x < x0, (torch.abs(x0 - x) ** p) / (p * x * (p - 1)), torch.tensor(0.0, device=x.device)) 
+            return -w_rep * torch.sum(rep)
+
+        rep = rep_fn(D)
+
+        force = torch.autograd.grad(rep, lig_pos, retain_graph=False)[0]
+
+    return force.mean(dim=0).detach()
     
 #----------------------------------------------------------------------------
 # Sampler
@@ -296,6 +317,7 @@ def Euler_Maruyama_sampler(
     device='cpu',
     batch_size=1, 
     eps=1e-3,
+    use_clash_force=False,
 ):
 
     # initialize time steps
@@ -305,6 +327,7 @@ def Euler_Maruyama_sampler(
     # get initial pose
     rec_pos = batch["rec_pos"] 
     lig_pos = batch["lig_pos"] 
+
 
     # randomly initialize coordinates
     lig_pos, tr_update, rot_update = randomize_pose(rec_pos, lig_pos)
@@ -349,12 +372,17 @@ def Euler_Maruyama_sampler(
             tr_update = tr_update + tr
             rot_update = rot_compose(rot_update, rot)
 
+            if use_clash_force:
+                clash_force = get_clash_force(rec_pos.detach().clone(), lig_pos.detach().clone())
+                lig_pos = lig_pos + clash_force
+                tr_update = tr_update + clash_force
+
             if is_last:
                 batch["rec_pos"] = rec_pos.clone().detach()
                 batch["lig_pos"] = lig_pos.clone().detach()
                 output = model(batch) 
 
-    return rec_pos, lig_pos, tr_update, rot_update, output["energy"], output["num_clashes"]
+    return rec_pos, lig_pos, rot_update, tr_update, output["energy"], output["num_clashes"]
 
     
 
@@ -395,11 +423,12 @@ def main(args):
 
     # run 
     for i in range(args.num_samples):
-        rec_pos, lig_pos, tr_update, rot_update, energy, num_clashes = Euler_Maruyama_sampler(
+        rec_pos, lig_pos, rot_update, tr_update, energy, num_clashes = Euler_Maruyama_sampler(
             model=model, 
             batch=batch, 
             num_steps=args.num_steps,
             device=device,
+            use_clash_force=args.use_clash_force,
         )
         
     
@@ -427,6 +456,7 @@ if __name__ == "__main__":
     parser.add_argument("--num_steps", type=int, help="Number of sde steps", default=40) 
     parser.add_argument("--tr_noise_scale", type=float, help="Translation noise scale", default=0.5) 
     parser.add_argument("--rot_noise_scale", type=int, help="Rotation noise scale", default=0.5) 
+    parser.add_argument("--use_clash_force", action='store_true', help="Use clash force") 
 
     # Parse the arguments
     args = parser.parse_args()
