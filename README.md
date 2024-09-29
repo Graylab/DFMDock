@@ -1,12 +1,6 @@
 # DFMDock
 DFMDock (Denoising Force Matching Dock), a diffusion model that unifies sampling and ranking within a single framework.
 
-
-## Prerequisites
-
-- [Git](https://git-scm.com/)
-- [Conda](https://docs.conda.io/projects/conda/en/latest/user-guide/install/)
-
 ## Setup
 
 ### 1. Clone the Repository
