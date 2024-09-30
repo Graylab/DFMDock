@@ -2,6 +2,7 @@ name: DFMDock
 channels:
   - conda-forge
 dependencies:
+  - python=3.10
   - _libgcc_mutex=0.1=conda_forge
   - _openmp_mutex=4.5=2_gnu
   - bzip2=1.0.8=h4bc722e_7
@@ -75,11 +76,8 @@ dependencies:
       - requests==2.32.3
       - scipy==1.14.1
       - sympy==1.12
-      - torch==2.4.1+cu118
       - torch-geometric==2.6.0
-      - torchaudio==2.4.1+cu118
       - torchmetrics==1.4.2
-      - torchvision==0.19.1+cu118
       - tqdm==4.66.5
       - triton==3.0.0
       - typing-extensions==4.9.0

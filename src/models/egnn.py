@@ -1,3 +1,6 @@
+# The code is adopted from:
+# https://github.com/vgsatorras/egnn
+
 import torch
 from torch import nn
 from torch_geometric.nn.norm import GraphNorm
