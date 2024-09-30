@@ -318,10 +318,12 @@ def Euler_Maruyama_sampler(
     batch_size=1, 
     eps=1e-3,
     use_clash_force=False,
+    tr_noise_scale=0.5,
+    rot_noise_scale=0.5,
 ):
 
     # initialize time steps
-    time_steps = torch.linspace(1., eps, args.num_steps, device=device)
+    time_steps = torch.linspace(1., eps, num_steps, device=device)
     dt = time_steps[0] - time_steps[1]
 
     # get initial pose
@@ -347,8 +349,8 @@ def Euler_Maruyama_sampler(
             output = model(batch) 
 
             if not is_last:
-                tr_noise_scale = args.tr_noise_scale
-                rot_noise_scale = args.rot_noise_scale
+                tr_noise_scale = tr_noise_scale
+                rot_noise_scale = rot_noise_scale
             else:
                 tr_noise_scale = 0.0
                 rot_noise_scale = 0.0
@@ -429,6 +431,8 @@ def main(args):
             num_steps=args.num_steps,
             device=device,
             use_clash_force=args.use_clash_force,
+            tr_noise_scale=args.tr_noise_scale,
+            rot_noise_scale=args.rot_noise_scale,
         )
         
     
@@ -443,6 +447,8 @@ def main(args):
     file.set_structure(complex_structure)
     file.write("output.pdb")
 
+#----------------------------------------------------------------------------
+# inference function
 
 def inference(in_pdb_1, in_pdb_2):
     # set device
