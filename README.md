@@ -48,7 +48,7 @@ This will initiate the process to reproduce the results as described in the pape
 To run inference on your own PDB files, use the following command:
 
 ```bash
-python src/inference_app.py path_to_input_pdb_1 path_to_input_pdb_2
+python src/inference_single.py path_to_input_pdb_1 path_to_input_pdb_2
 ```
 
 ### Citing this work
