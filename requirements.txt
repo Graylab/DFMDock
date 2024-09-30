@@ -8,7 +8,6 @@ biotite==1.0.1
 biotraj==1.2.1
 certifi==2024.8.30
 charset-normalizer==3.3.2
--e git+https://github.com/Graylab/DFMDock.git@4ef63ec164fa17df2152edb378f4517da9b3fa83#egg=DFMDock
 dm-tree==0.1.8
 einops==0.8.0
 fair-esm==2.0.0

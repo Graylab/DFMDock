@@ -394,7 +394,7 @@ def main(args):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     # load esm model
-    esm_model, alphabet = esm.pretrained.load_model_and_alphabet('/home/lchu11/.cache/torch/hub/checkpoints/esm2_t33_650M_UR50D.pt')
+    esm_model, alphabet = esm.pretrained.esm2_t33_650M_UR50D()
     batch_converter = alphabet.get_batch_converter()
     esm_model = esm_model.to(device).eval()
     
@@ -429,6 +429,63 @@ def main(args):
             num_steps=args.num_steps,
             device=device,
             use_clash_force=args.use_clash_force,
+        )
+        
+    
+    lig_aa_coords = modify_aa_coords(ligand["aa_coords"], rot_update, tr_update)
+    rec_structure = receptor["structure"]
+    lig_structure = ligand["structure"]
+    lig_structure.coord = lig_aa_coords
+
+    complex_structure = combine_atom_arrays(rec_structure, lig_structure)
+
+    file = PDBFile()
+    file.set_structure(complex_structure)
+    file.write("output.pdb")
+
+
+def inference(in_pdb_1, in_pdb_2):
+    # set device
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    # load esm model
+    esm_model, alphabet = esm.pretrained.esm2_t33_650M_UR50D()
+    batch_converter = alphabet.get_batch_converter()
+    esm_model = esm_model.to(device).eval()
+    
+    # load score model
+    model = Score_Model.load_from_checkpoint(
+        "./DFMDock/checkpoints/dips/model_0.ckpt", 
+        map_location=device,
+    )
+
+    model.to(device).eval()
+
+    # load pdbs
+    receptor = get_info_from_pdb(in_pdb_1)
+    ligand = get_info_from_pdb(in_pdb_2)
+
+    # prepare inputs 
+    inputs = {
+        "receptor": receptor,
+        "ligand": ligand,
+    }
+
+    batch = get_batch_from_inputs(inputs, batch_converter, esm_model, device)
+
+    # define 
+    num_samples=1
+    num_steps=40
+    use_clash_force=True
+
+    # run 
+    for i in range(num_samples):
+        rec_pos, lig_pos, rot_update, tr_update, energy, num_clashes = Euler_Maruyama_sampler(
+            model=model, 
+            batch=batch, 
+            num_steps=num_steps,
+            device=device,
+            use_clash_force=use_clash_force,
         )
         
     
