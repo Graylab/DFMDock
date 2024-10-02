@@ -62,8 +62,9 @@ def combine_atom_arrays(atom_array_1, atom_array_2):
     # Transfer additional attributes from the original AtomArray objects
     combined_structure.element = np.concatenate([atom_array_1.element, atom_array_2.element])
 
-    # Handle optional attributes like atom names, residue IDs, chain IDs, etc.
+    # Handle optional attributes like atom names, residue names, residue IDs, chain IDs, etc.
     combined_structure.atom_name = np.concatenate([atom_array_1.atom_name, atom_array_2.atom_name])
+    combined_structure.res_name = np.concatenate([atom_array_1.res_name, atom_array_2.res_name])
     combined_structure.res_id = np.concatenate([atom_array_1.res_id, atom_array_2.res_id])
     combined_structure.chain_id = np.concatenate([atom_array_1.chain_id, atom_array_2.chain_id])
 

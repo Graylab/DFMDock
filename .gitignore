@@ -165,5 +165,6 @@ slogs/
 outputs/
 *.pdb
 *.csv
+*.ipynb
 inference_gpu.sh
 submit_inference.sh
