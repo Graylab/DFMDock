@@ -125,6 +125,9 @@ def get_info_from_pdb(pdb_path):
     # Load the structure from the PDB file
     structure = strucio.load_structure(pdb_path)
 
+    # Filter for only ATOM lines
+    structure = structure[~structure.hetero]
+
     # Get the atomic coordinates as a NumPy array
     aa_coords = structure.coord  # all-atom coordinates
 
