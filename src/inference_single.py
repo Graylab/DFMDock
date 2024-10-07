@@ -427,6 +427,9 @@ def main(args):
 
     batch = get_batch_from_inputs(inputs, batch_converter, esm_model, device)
 
+    # Move the batch to the same device as the model
+    batch = {k: v.to(device) for k, v in batch.items()}
+
     # run 
     for i in range(args.num_samples):
         rec_pos, lig_pos, rot_update, tr_update, energy, num_clashes = Euler_Maruyama_sampler(
