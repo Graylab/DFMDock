@@ -2,6 +2,7 @@ import warnings
 warnings.filterwarnings("ignore", category=FutureWarning)
 
 import os
+import csv
 import esm
 import torch
 import torch.nn.functional as F
@@ -15,7 +16,9 @@ from scipy.spatial.transform import Rotation
 from utils.geometry import axis_angle_to_matrix, matrix_to_axis_angle
 from utils.residue_constants import restype_3to1, sequence_to_onehot, restype_order_with_x
 from utils.pdb import save_PDB, place_fourth_atom 
+from utils.metrics import compute_metrics
 from models.score_model import Score_Model
+
 
 #----------------------------------------------------------------------------
 # output functions
@@ -70,6 +73,7 @@ def combine_atom_arrays(atom_array_1, atom_array_2):
 
     return combined_structure
 
+
 #----------------------------------------------------------------------------
 # pre-process functions
 
@@ -120,7 +124,6 @@ def relpos(res_id, asym_id, use_chain_relative=True):
     rel_feat = torch.cat(rel_feats, dim=-1).float()
 
     return rel_feat
-
 
 def get_info_from_pdb(pdb_path):
     # Load the structure from the PDB file
@@ -174,8 +177,8 @@ def get_batch_from_inputs(inputs, batch_converter, esm_model, device):
     lig_esm = get_esm_rep(inputs['ligand']['seq'], batch_converter, esm_model, device)
 
     # node embeddings
-    rec_x = torch.cat([rec_esm, rec_onehot], dim=-1)
-    lig_x = torch.cat([lig_esm, lig_onehot], dim=-1)
+    rec_x = torch.cat([rec_esm, rec_onehot], dim=-1).to(device)
+    lig_x = torch.cat([lig_esm, lig_onehot], dim=-1).to(device)
 
     # coords
     rec_pos = torch.from_numpy(inputs['receptor']['bb_coords']).float().to(device)
@@ -213,6 +216,7 @@ def get_esm_rep(seq_prim, batch_converter, esm_model, device):
         rep = results["representations"][33].cpu()
     
     return rep[0, 1:-1, :]
+
 
 #----------------------------------------------------------------------------
 # coords functions
@@ -310,7 +314,8 @@ def get_clash_force(rec_pos, lig_pos):
         force = torch.autograd.grad(rep, lig_pos, retain_graph=False)[0]
 
     return force.mean(dim=0).detach()
-    
+
+
 #----------------------------------------------------------------------------
 # Sampler
 
@@ -322,6 +327,7 @@ def Euler_Maruyama_sampler(
     batch_size=1, 
     eps=1e-3,
     use_clash_force=False,
+    noise_annealing=False,
     tr_noise_scale=0.5,
     rot_noise_scale=0.5,
 ):
@@ -352,12 +358,16 @@ def Euler_Maruyama_sampler(
             # get predictions
             output = model(batch) 
 
-            if not is_last:
-                tr_noise_scale = tr_noise_scale
-                rot_noise_scale = rot_noise_scale
+            if noise_annealing:
+                tr_noise_scale = time_step
+                rot_noise_scale = time_step
             else:
-                tr_noise_scale = 0.0
-                rot_noise_scale = 0.0
+                if not is_last:
+                    tr_noise_scale = tr_noise_scale
+                    rot_noise_scale = rot_noise_scale
+                else:
+                    tr_noise_scale = 0.0
+                    rot_noise_scale = 0.0
 
             rot = model.so3_diffuser.torch_reverse(
                 score_t=output["rot_score"].detach(),
@@ -390,66 +400,6 @@ def Euler_Maruyama_sampler(
 
     return rec_pos, lig_pos, rot_update, tr_update, output["energy"], output["num_clashes"]
 
-    
-
-#----------------------------------------------------------------------------
-# main function
-
-def main(args):
-    # set device
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-    # load esm model
-    esm_model, alphabet = esm.pretrained.esm2_t33_650M_UR50D()
-    batch_converter = alphabet.get_batch_converter()
-    esm_model = esm_model.to(device).eval()
-    
-    # load score model
-    model = Score_Model.load_from_checkpoint(
-        args.ckpt, 
-        map_location=device,
-    )
-
-    model.to(device).eval()
-
-    # load pdbs
-    in_pdb_1 = args.in_pdb_1
-    in_pdb_2 = args.in_pdb_2
-
-    receptor = get_info_from_pdb(in_pdb_1)
-    ligand = get_info_from_pdb(in_pdb_2)
-
-    # prepare inputs 
-    inputs = {
-        "receptor": receptor,
-        "ligand": ligand,
-    }
-
-    batch = get_batch_from_inputs(inputs, batch_converter, esm_model, device)
-
-    # run 
-    for i in range(args.num_samples):
-        rec_pos, lig_pos, rot_update, tr_update, energy, num_clashes = Euler_Maruyama_sampler(
-            model=model, 
-            batch=batch, 
-            num_steps=args.num_steps,
-            device=device,
-            use_clash_force=args.use_clash_force,
-            tr_noise_scale=args.tr_noise_scale,
-            rot_noise_scale=args.rot_noise_scale,
-        )
-        
-    
-    lig_aa_coords = modify_aa_coords(ligand["aa_coords"], rot_update, tr_update)
-    rec_structure = receptor["structure"]
-    lig_structure = ligand["structure"]
-    lig_structure.coord = lig_aa_coords
-
-    complex_structure = combine_atom_arrays(rec_structure, lig_structure)
-
-    file = PDBFile()
-    file.set_structure(complex_structure)
-    file.write("output.pdb")
 
 #----------------------------------------------------------------------------
 # inference function
@@ -511,19 +461,149 @@ def inference(in_pdb_1, in_pdb_2):
     file.write("output.pdb")
 
 
+#----------------------------------------------------------------------------
+# run function
+
+def run(args, model, inputs, batch, device):
+    metrics_list = []
+    for i in range(args.num_samples):
+        rec_pos, lig_pos, rot_update, tr_update, energy, num_clashes = Euler_Maruyama_sampler(
+            model=model, 
+            batch=batch, 
+            num_steps=args.num_steps,
+            device=device,
+            use_clash_force=args.use_clash_force,
+            noise_annealing=args.noise_annealing,
+            tr_noise_scale=args.tr_noise_scale,
+            rot_noise_scale=args.rot_noise_scale,
+        )
+        
+        id = inputs["id"]
+
+        # get metrics
+        metrics = {'id': id, 'index': str(i)}
+        pred = (rec_pos.detach().cpu(), lig_pos.detach().cpu())
+        native = (torch.from_numpy(inputs['receptor']['bb_coords']).float(), torch.from_numpy(inputs['ligand']['bb_coords']).float())
+        metrics.update(compute_metrics(pred, native))
+        metrics.update({'energy': energy.item()})
+        metrics.update({'num_clashes': num_clashes.item()})
+        metrics_list.append(metrics)
+
+        # get aa structure
+        lig_aa_coords = modify_aa_coords(inputs["ligand"]["aa_coords"], rot_update, tr_update)
+        rec_structure = inputs["receptor"]["structure"]
+        lig_structure = inputs["ligand"]["structure"]
+        lig_structure.coord = lig_aa_coords
+        complex_structure = combine_atom_arrays(rec_structure, lig_structure)
+        
+        # output
+        out_pdb =  os.path.join(args.out_dir, f'{id}_{i}.pdb')
+        file = PDBFile()
+        file.set_structure(complex_structure)
+        file.write(out_pdb)
+
+    return metrics_list 
+
+
+#----------------------------------------------------------------------------
+# main function
+
+def main(args):
+    paths_list = []
+    if args.paths:
+        id, in_pdb_1, in_pdb_2 = args.paths
+        if os.path.exists(in_pdb_1) and os.path.exists(in_pdb_2):
+            paths_list.append((id, in_pdb_1, in_pdb_2))
+        else:
+            print("One or both paths do not exist.")
+    elif args.csv:
+        if os.path.exists(args.csv):
+            with open(args.csv, 'r') as f:
+                reader = csv.reader(f)
+                for row in reader:
+                    id, in_pdb_1, in_pdb_2 = row[0], row[1], row[2]
+                    paths_list.append((id, in_pdb_1, in_pdb_2))
+        else:
+            print("CSV file does not exist.")
+
+    # create output directory if not exist
+    if not os.path.exists(args.out_dir):
+        os.makedirs(args.out_dir)
+
+    # set device
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    # load esm model
+    esm_model, alphabet = esm.pretrained.esm2_t33_650M_UR50D()
+    batch_converter = alphabet.get_batch_converter()
+    esm_model = esm_model.to(device).eval()
+    
+    # load score model
+    model = Score_Model.load_from_checkpoint(
+        args.ckpt, 
+        map_location=device,
+    )
+
+    model.to(device).eval()
+
+    results = []
+    # inference
+    for id, in_pdb_1, in_pdb_2 in paths_list:
+        receptor = get_info_from_pdb(in_pdb_1)
+        ligand = get_info_from_pdb(in_pdb_2)
+
+        # prepare inputs 
+        inputs = {
+            "id": id,
+            "receptor": receptor,
+            "ligand": ligand,
+        }
+
+        batch = get_batch_from_inputs(inputs, batch_converter, esm_model, device)
+
+        # Move the batch to the same device as the model
+        batch = {k: v.to(device) for k, v in batch.items()}
+
+        # run
+        metrics_list = run(args, model, inputs, batch, device)
+
+        results.extend(metrics_list)
+
+    # write metrics to csv
+    if not os.path.exists(args.out_csv_dir):
+        os.makedirs(args.out_csv_dir)
+
+    # set output directory
+    output_filename =  os.path.join(args.out_csv_dir, args.out_csv)
+
+    with open(output_filename, "w", newline="") as csvfile:
+        # Write header row to CSV file
+        header = list(results[0].keys())
+        writer = csv.DictWriter(csvfile, fieldnames=header)
+        writer.writeheader()
+
+        for row in results:
+            writer.writerow(row)
+
+
 if __name__ == "__main__":
     # Initialize the parser
     parser = argparse.ArgumentParser(description="A description of what your program does")
 
     # Add arguments
-    parser.add_argument("in_pdb_1", type=str, help="Path to the pdb 1") 
-    parser.add_argument("in_pdb_2", type=str, help="Path to the pdb 2") 
+    group = parser.add_mutually_exclusive_group(required=True)
+    group.add_argument('--paths', nargs=3, metavar=('id', 'in_pdb_1', 'in_pdb_2'), help='Input two pdb paths')
+    group.add_argument('--csv', type=str, help='Input a CSV file containing pdb paths')
     parser.add_argument("--ckpt", type=str, help="Path to the checkpoint file", default='../checkpoints/dips/model_0.ckpt') 
+    parser.add_argument("--out_dir", type=str, help="Path to the output file", default='./pdbs') 
+    parser.add_argument("--out_csv_dir", type=str, help="Path to the output file", default='./csv_files') 
+    parser.add_argument("--out_csv", type=str, help="Path to the output file", default='./test.csv') 
     parser.add_argument("--num_samples", type=int, help="Number of sample poses", default=1) 
     parser.add_argument("--num_steps", type=int, help="Number of sde steps", default=40) 
     parser.add_argument("--tr_noise_scale", type=float, help="Translation noise scale", default=0.5) 
     parser.add_argument("--rot_noise_scale", type=int, help="Rotation noise scale", default=0.5) 
     parser.add_argument("--use_clash_force", action='store_true', help="Use clash force") 
+    parser.add_argument("--noise_annealing", action='store_true', help="Use clash force") 
 
     # Parse the arguments
     args = parser.parse_args()

@@ -163,8 +163,11 @@ cython_debug/
 
 slogs/
 outputs/
+scripts/
+checkpoints/
 *.pdb
 *.csv
 *.ipynb
+*.png
 inference_gpu.sh
 submit_inference.sh
