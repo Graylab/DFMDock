@@ -359,10 +359,7 @@ class EGNN_Net(nn.Module):
 
         # edge feature embedding
         spatial_matrix = get_pairs(pos)
-        #spatial_matrix = get_spatial_matrix(pos)
-        edge = self.spatial_embed(spatial_matrix)
-        edge += self.positional_embed(position_matrix)
-        #edge = self.spatial_embed(spatial_matrix) + self.positional_embed(position_matrix)
+        edge = self.spatial_embed(spatial_matrix) + self.positional_embed(position_matrix)
 
         # sample edge_index and get edge_attr
         edge_index, edge_attr = get_knn_and_sample_graph(pos[..., 1, :], edge)
@@ -391,7 +388,7 @@ class EGNN_Net(nn.Module):
             return energy
 
         # tm score head
-        tm_logits = self.to_tm_logits(interaction)
+        tm_logits = self.to_tm_logits(interaction.detach())
 
         # force
         lig_pos_curr = pos_out[rec_pos.size(0):] 

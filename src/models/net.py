@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
+import math
 from dataclasses import dataclass
 from einops import repeat
 from models.egnn import E_GCL
@@ -28,6 +29,9 @@ class ModelConfig:
 
 #----------------------------------------------------------------------------
 # Helper functions
+
+def modulate(x, shift, scale):
+    return x * (1 + scale) + shift
 
 def get_spatial_matrix(coord):
     dist, omega, theta, phi = get_coords6d(coord)
@@ -161,6 +165,46 @@ def get_knn_and_sample_graph(x, e, knn=20, sample_size=40):
 #----------------------------------------------------------------------------
 # nn Modules
 
+class TimestepEmbedder(nn.Module):
+    """
+    Embeds scalar timesteps into vector representations.
+    """
+    def __init__(self, hidden_size, frequency_embedding_size=256):
+        super().__init__()
+        self.mlp = nn.Sequential(
+            nn.Linear(frequency_embedding_size, hidden_size, bias=True),
+            nn.SiLU(),
+            nn.Linear(hidden_size, hidden_size, bias=True),
+        )
+        self.frequency_embedding_size = frequency_embedding_size
+
+    @staticmethod
+    def timestep_embedding(t, dim, max_period=10000):
+        """
+        Create sinusoidal timestep embeddings.
+        :param t: a 1-D Tensor of N indices, one per batch element.
+                          These may be fractional.
+        :param dim: the dimension of the output.
+        :param max_period: controls the minimum frequency of the embeddings.
+        :return: an (N, D) Tensor of positional embeddings.
+        """
+        # https://github.com/openai/glide-text2im/blob/main/glide_text2im/nn.py
+        half = dim // 2
+        freqs = torch.exp(
+            -math.log(max_period) * torch.arange(start=0, end=half, dtype=torch.float32) / half
+        ).to(device=t.device)
+        args = t[:, None].float() * freqs[None]
+        embedding = torch.cat([torch.cos(args), torch.sin(args)], dim=-1)
+        if dim % 2:
+            embedding = torch.cat([embedding, torch.zeros_like(embedding[:, :1])], dim=-1)
+        return embedding
+
+    def forward(self, t):
+        t_freq = self.timestep_embedding(t, self.frequency_embedding_size)
+        t_emb = self.mlp(t_freq)
+        return t_emb
+
+
 class GaussianFourierProjection(nn.Module):
     """Gaussian random features for encoding time steps."""  
     def __init__(self, embed_dim, scale=1.):
@@ -204,8 +248,17 @@ class EGNNLayer(nn.Module):
             dropout=dropout,
         )
 
-    def forward(self, h, x, edges, edge_attr=None, lig_mask=None):
-        h, x, edge_attr = self.egcl(h, edges, x, edge_attr=edge_attr, lig_mask=lig_mask)
+        self.norm = nn.LayerNorm(node_dim, elementwise_affine=False, eps=1e-6)
+        self.adaLN_modulation = nn.Sequential(
+            nn.SiLU(),
+            nn.Linear(node_dim, 3 * node_dim, bias=True)
+        )
+
+    def forward(self, h, x, edges, t, edge_attr=None, lig_mask=None):
+        shift_mlp, scale_mlp, gate_mlp = self.adaLN_modulation(t).chunk(3, dim=1)
+        h_in = modulate(self.norm(h), shift_mlp, scale_mlp)
+        h_in, x, edge_attr = self.egcl(h_in, edges, x, edge_attr=edge_attr, lig_mask=lig_mask)
+        h = h + gate_mlp * h_in 
         return h, x, edge_attr
 
 
@@ -238,10 +291,25 @@ class EGNN(nn.Module):
                 update_coords=is_last,
             )
         )
+            
+        self.t_embedder = TimestepEmbedder(node_dim)
 
-    def forward(self, h, x, edges, edge_attr=None, lig_mask=None):
+        self.initialize_weights()
+            
+    def initialize_weights(self):
+        # Initialize timestep embedding MLP:
+        nn.init.normal_(self.t_embedder.mlp[0].weight, std=0.02)
+        nn.init.normal_(self.t_embedder.mlp[2].weight, std=0.02)
+
         for i in range(self.depth):
-            h, x, edge_attr = self._modules["EGNN_%d" % i](h, x, edges, edge_attr=edge_attr, lig_mask=lig_mask)
+            block = self._modules["EGNN_%d" % i] 
+            nn.init.constant_(block.adaLN_modulation[-1].weight, 0)
+            nn.init.constant_(block.adaLN_modulation[-1].bias, 0)
+
+    def forward(self, h, x, edges, t, edge_attr=None, lig_mask=None):
+        t = self.t_embedder(t)
+        for i in range(self.depth):
+            h, x, edge_attr = self._modules["EGNN_%d" % i](h, x, edges, t, edge_attr=edge_attr, lig_mask=lig_mask)
         return h, x, edge_attr
 
 
@@ -325,17 +393,6 @@ class EGNN_Net(nn.Module):
             nn.Linear(inner_dim, 1, bias=False),
             nn.Softplus()
         )
-
-        self.apply(self._init_weights)
-
-    def _init_weights(self, module):
-        if isinstance(module, nn.Linear):
-            module.weight.data.normal_(mean=0.0, std=0.02)
-            if module.bias is not None:
-                module.bias.data.zero_()
-        elif isinstance(module, nn.LayerNorm):
-            module.bias.data.zero_()
-            module.weight.data.fill_(1.0)
         
     def forward(self, batch, predict=False, return_energy=False):
         # get inputs
@@ -369,7 +426,7 @@ class EGNN_Net(nn.Module):
         lig_mask[rec_x.size(0):] = 1.0
 
         # main network 
-        node_out, pos_out, _ = self.network(node, pos[..., 1, :], edge_index, edge_attr, lig_mask) # [R+L, H]
+        node_out, pos_out, _ = self.network(node, pos[..., 1, :], edge_index, t.repeat(x.size(0)), edge_attr, lig_mask) # [R+L, H]
 
         # energy
         h_rec = repeat(node_out[:rec_pos.size(0)], 'n h -> n m h', m=lig_pos.size(0))
@@ -388,7 +445,7 @@ class EGNN_Net(nn.Module):
             return energy
 
         # tm score head
-        tm_logits = self.to_tm_logits(interaction)
+        tm_logits = self.to_tm_logits(interaction.detach())
 
         # force
         lig_pos_curr = pos_out[rec_pos.size(0):] 
