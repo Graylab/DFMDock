@@ -12,7 +12,7 @@ NUM_STEPS=40
 RUN=${1:-0}
 
 # Execute the code
-python ../src/inference.py \
+python ../src/inference_mlsb.py \
   data.ckpt=../checkpoints/${TRAIN_SET}/${MODEL}.ckpt \
   data.dataset=${TEST_SET} \
   data.out_csv_dir=csv_files/ \

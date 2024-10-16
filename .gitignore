@@ -165,6 +165,7 @@ slogs/
 outputs/
 scripts/
 checkpoints/
+lightning_logs/
 *.pdb
 *.csv
 *.ipynb
