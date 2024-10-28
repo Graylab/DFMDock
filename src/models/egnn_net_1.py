@@ -44,7 +44,7 @@ def get_spatial_matrix(coord):
     phi_bin = get_bins(phi, 0.0, 180.0, num_phi_bins)
 
     def mask_mat(mat, num_bins):
-        mat[~mask] = num_bins - 1
+        mat[~mask] = 0
         mat.fill_diagonal_(0)
         return mat
 
@@ -264,7 +264,6 @@ class EGNN(nn.Module):
         super(EGNN, self).__init__()
         self.depth = depth
         for i in range(depth):
-            is_last = i == depth - 1
             self.add_module("EGNN_%d" % i, EGNNLayer(
                 node_dim=node_dim, 
                 edge_dim=edge_dim,
@@ -274,14 +273,14 @@ class EGNN(nn.Module):
                 normalize=normalize, 
                 tanh=tanh,
                 dropout=dropout,
-                update_coords=is_last,
+                update_coords=False,
             )
         )
 
     def forward(self, h, x, edges, edge_attr=None, lig_mask=None):
         for i in range(self.depth):
             h, x, edge_attr = self._modules["EGNN_%d" % i](h, x, edges, edge_attr=edge_attr, lig_mask=lig_mask)
-        return h, x
+        return h
 
 
 #----------------------------------------------------------------------------
@@ -329,6 +328,14 @@ class EGNN_Net(nn.Module):
 
         # energy head
         self.to_energy = nn.Sequential(
+            nn.Linear(2*node_dim + 1, node_dim, bias=False),
+            nn.LayerNorm(node_dim),
+            nn.SiLU(),
+            nn.Linear(node_dim, 1, bias=False),
+        )
+
+        # force head 
+        self.to_force = nn.Sequential(
             nn.Linear(2*node_dim + 1, node_dim, bias=False),
             nn.LayerNorm(node_dim),
             nn.SiLU(),
@@ -409,6 +416,7 @@ class EGNN_Net(nn.Module):
 
         # get ca distance matrix 
         vec = rec_pos[:, None, 1, :] - lig_pos[None, :, 1, :] 
+        unit_vec = F.normalize(vec, dim=-1)
         D = torch.norm(vec, dim=-1)
         
         # get current complex pose
@@ -427,11 +435,11 @@ class EGNN_Net(nn.Module):
         edge_index, edge_attr = get_knn_and_sample_graph(pos[..., 1, :], edge)
 
         # main network 
-        node_out, pos_out = self.network(node, pos[..., 1, :], edge_index, edge_attr) # [R+L, H]
+        node = self.network(node, pos[..., 1, :], edge_index, edge_attr) # [R+L, H]
 
         # energy
-        h_rec = repeat(node_out[:rec_pos.size(0)], 'n h -> n m h', m=lig_pos.size(0))
-        h_lig = repeat(node_out[rec_pos.size(0):], 'm h -> n m h', n=rec_pos.size(0))
+        h_rec = repeat(node[:rec_pos.size(0)], 'n h -> n m h', m=lig_pos.size(0))
+        h_lig = repeat(node[rec_pos.size(0):], 'm h -> n m h', n=rec_pos.size(0))
         interaction = torch.cat([h_rec, h_lig, D.unsqueeze(-1)], dim=-1)
         energy = self.to_energy(interaction).squeeze(-1) # [R, L]
         mask_2D = (D < self.cut_off).float() # [R, L]
@@ -454,9 +462,11 @@ class EGNN_Net(nn.Module):
         ires_logits = self.to_ires(node)
 
         # force
-        lig_pos_curr = pos_out[rec_pos.size(0):] 
-        r = lig_pos[..., 1, :].detach()
-        f = lig_pos_curr - r # f / kT
+        fij = unit_vec * self.to_force(interaction) 
+        if self.agg == 'mean':
+            f = fij.mean(dim=0)
+        else:
+            f = fij.sum(dim=0)
 
         # translation
         if self.agg == 'mean':
@@ -465,6 +475,7 @@ class EGNN_Net(nn.Module):
             tr_pred = f.sum(dim=0, keepdim=True)
 
         # rotation
+        r = lig_pos[..., 1, :].detach()
         if self.agg == 'mean':
             rot_pred = torch.cross(r, f, dim=-1).mean(dim=0, keepdim=True)
         else:

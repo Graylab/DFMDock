@@ -25,34 +25,30 @@ def get_rotat(coords):
 def get_trans(coords):
     return coords[:, 1, :]
 
-def get_pair_dist(coords):
-    coords = coords[:, 1, :]
-    vec = repeat(coords, 'i c -> i j c', j=coords.size(0)) - repeat(coords, 'j c -> i j c', i=coords.size(0))
+def get_pair_dist(trans):
+    vec = repeat(trans, 'i c -> i j c', j=trans.size(0)) - repeat(trans, 'j c -> i j c', i=trans.size(0))
     dist = torch.norm(vec, dim=-1, keepdim=True)
     dist = rbf(dist, 2.0, 22.0, n_bins=16)
     return dist
 
-def get_pair_direct(coords):
-    ca_coords = coords[:, 1, :]
-    vec = repeat(ca_coords, 'i c -> i j c', j=coords.size(0)) - repeat(ca_coords, 'j c -> i j c', i=coords.size(0))
+def get_pair_direct(trans, rotat):
+    vec = repeat(trans, 'i c -> i j c', j=trans.size(0)) - repeat(trans, 'j c -> i j c', i=trans.size(0))
     direct = F.normalize(vec, dim=-1)
-    rotat = get_rotat(coords)
     rotat = repeat(rotat, 'r i j -> r c i j', c=rotat.size(0))
     direct = torch.einsum('r c i j, r c j -> r c i', rotat.transpose(-1, -2), direct)
     return direct
 
-def get_pair_orient(coords):
-    rotat = get_rotat(coords)
+def get_pair_orient(trans, rotat):
     rotat_i = repeat(rotat, 'r i j -> r c i j', c=rotat.size(0))
     rotat_j = repeat(rotat, 'c i j -> r c i j', r=rotat.size(0))
     orient = torch.einsum('r c i j, r c j k -> r c i k', rotat_i.transpose(-1, -2), rotat_j)
     orient = matrix_to_rotation_6d(orient)
     return orient
 
-def get_pairs(coords):
-    dists = get_pair_dist(coords)
-    direct = get_pair_direct(coords)
-    orient = get_pair_orient(coords)
+def get_pairs(trans, rotat):
+    dists = get_pair_dist(trans)
+    direct = get_pair_direct(trans, rotat)
+    orient = get_pair_orient(trans, rotat)
     pair = torch.cat([dists, direct, orient], dim=-1)
     return pair
 

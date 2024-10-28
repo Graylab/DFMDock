@@ -61,3 +61,33 @@ def get_tm_loss(
     loss = torch.mean(errors)
 
     return loss
+
+def distogram_loss(
+    logits,
+    dists,
+    min_bin=3.25, 
+    max_bin=50.75,
+    no_bins=64,
+    eps=1e-6,
+    **kwargs,
+) -> torch.Tensor:
+    """
+    """
+    boundaries = torch.linspace(
+        min_bin,
+        max_bin,
+        no_bins - 1,
+        device=logits.device,
+    )
+    boundaries = boundaries ** 2
+
+    true_bins = torch.sum(dists ** 2 > boundaries, dim=-1)
+
+    errors = softmax_cross_entropy(
+        logits,
+        torch.nn.functional.one_hot(true_bins, no_bins),
+    )
+
+    loss = torch.mean(errors)
+
+    return loss

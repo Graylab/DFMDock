@@ -1,8 +1,8 @@
-_target_: models.DFMDock.DFMDock
+_target_: models.DFMDock_guide.DFMDock
 
 model:
-  lm_embed_dim: 1301 # 1280 (ESM) + 21 (One-Hot) 
-  positional_embed_dim: 66 # 66 (Residue)
+  lm_embed_dim: 1302 # 1280 (ESM) + 21 (One-Hot) + 1 (interface)
+  positional_embed_dim: 67 # 66 (Residue) + 1 (contact)
   spatial_embed_dim: 100 # 40 (dist) + 24 (phi) + 24 (psi) + 12 (omega) 
   node_dim: 256
   edge_dim: 128
@@ -36,9 +36,9 @@ experiment:
   separate_energy_loss: True
   separate_tr_loss: True
   separate_rot_loss: True
-  grad_energy: False
+  grad_energy: True
   use_contrastive_loss: False
-  use_contact_loss: False
-  use_interface_loss: False
-  use_confidence_loss: False
+  use_contact_loss: True
+  use_interface_loss: True
+  use_confidence_loss: True
 

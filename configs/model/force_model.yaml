@@ -1,9 +1,9 @@
-_target_: models.DFMDock.DFMDock
+_target_: models.force_model.Force_Model
 
 model:
   lm_embed_dim: 1301 # 1280 (ESM) + 21 (One-Hot) 
   positional_embed_dim: 66 # 66 (Residue)
-  spatial_embed_dim: 100 # 40 (dist) + 24 (phi) + 24 (psi) + 12 (omega) 
+  spatial_embed_dim: 25 # 16 (dist) + 3 (direct) + 6 (orient)
   node_dim: 256
   edge_dim: 128
   inner_dim: 128
@@ -11,7 +11,6 @@ model:
   dropout: 0.1
   cut_off: 20.0
   normalize: True
-  agg: 'mean'
 
 diffuser:
   r3:
@@ -30,15 +29,10 @@ diffuser:
 experiment:
   lr: 1e-4
   weight_decay: 0.0
-  crop_size: 1200
   perturb_tr: True
   perturb_rot: True
-  separate_energy_loss: True
   separate_tr_loss: True
   separate_rot_loss: True
-  grad_energy: False
+  use_interface_loss: True
   use_contrastive_loss: False
-  use_contact_loss: False
-  use_interface_loss: False
-  use_confidence_loss: False
 

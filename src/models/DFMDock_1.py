@@ -11,7 +11,7 @@ from torch_geometric.loader import DataLoader
 from omegaconf import DictConfig
 from datasets.pinder_dataset import PinderDataset
 from datasets.docking_dataset import DockingDataset
-from models.egnn_net import EGNN_Net
+from models.egnn_net_1 import EGNN_Net
 from utils.so3_diffuser import SO3Diffuser 
 from utils.r3_diffuser import R3Diffuser 
 from utils.geometry import axis_angle_to_matrix, vector_to_skew_matrix
@@ -34,7 +34,7 @@ class DFMDock(pl.LightningModule):
         self.weight_decay = experiment.weight_decay
 
         # crop size
-        self.crop_size = experiment.crop_size
+        self.crop_size = 1200
 
         # confidence model
         self.use_confidence_loss = experiment.use_confidence_loss
@@ -110,9 +110,9 @@ class DFMDock(pl.LightningModule):
             # get crop_idxs
             crop_idxs = get_crop_idxs(batch_gt, crop_size=self.crop_size)
             
-            # crop
-            batch = get_crop(batch, crop_idxs)
-            batch_gt = get_crop(batch_gt, crop_idxs)
+            # pre crop
+            #batch = get_crop(batch, crop_idxs)
+            #batch_gt = get_crop(batch_gt, crop_idxs)
 
             # noised pose          
             batch["lig_pos"] = self.modify_coords(batch["lig_pos"], rot_update, tr_update)
@@ -123,6 +123,10 @@ class DFMDock(pl.LightningModule):
             # move lig center to origin
             self.move_to_lig_center(batch)
             self.move_to_lig_center(batch_gt)
+
+            # post crop
+            batch = get_crop(batch, crop_idxs)
+            batch_gt = get_crop(batch_gt, crop_idxs)
         
         # predict score based on the current state
         if self.grad_energy:
@@ -352,7 +356,7 @@ def get_rmsd(pred, label):
 #----------------------------------------------------------------------------
 # Testing run
 
-@hydra.main(version_base=None, config_path="/scratch4/jgray21/lchu11/graylab_repos/DFMDock/configs/model", config_name="DFMDock.yaml")
+@hydra.main(version_base=None, config_path="/scratch4/jgray21/lchu11/graylab_repos/DFMDock/configs/model", config_name="DFMDock_1.yaml")
 def main(conf: DictConfig):
     #dataset = PinderDataset(
     #    data_dir='/scratch4/jgray21/lchu11/data/pinder/train',

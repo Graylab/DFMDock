@@ -1,4 +1,4 @@
-_target_: models.DFMDock.DFMDock
+_target_: models.score_model_mlsb.Score_Model
 
 model:
   lm_embed_dim: 1301 # 1280 (ESM) + 21 (One-Hot) 
@@ -11,7 +11,6 @@ model:
   dropout: 0.1
   cut_off: 20.0
   normalize: True
-  agg: 'mean'
 
 diffuser:
   r3:
@@ -30,15 +29,12 @@ diffuser:
 experiment:
   lr: 1e-4
   weight_decay: 0.0
-  crop_size: 1200
   perturb_tr: True
   perturb_rot: True
   separate_energy_loss: True
   separate_tr_loss: True
   separate_rot_loss: True
+  use_interface_loss: True
   grad_energy: False
   use_contrastive_loss: False
-  use_contact_loss: False
-  use_interface_loss: False
-  use_confidence_loss: False
 

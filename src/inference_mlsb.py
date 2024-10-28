@@ -12,7 +12,7 @@ from dataclasses import dataclass
 from tqdm import tqdm
 from torch.utils import data
 from scipy.spatial.transform import Rotation 
-from models.score_model import Score_Model
+from models.score_model_mlsb import Score_Model
 from datasets.ppi_dataset import PPIDataset
 from utils.geometry import axis_angle_to_matrix, matrix_to_axis_angle
 from utils.pdb import save_PDB, place_fourth_atom 
@@ -412,7 +412,7 @@ class Sampler:
     
 #----------------------------------------------------------------------------
 # Main
-@hydra.main(version_base=None, config_path="../configs", config_name="inference") 
+@hydra.main(version_base=None, config_path="/scratch4/jgray21/lchu11/graylab_repos/DFMDock/configs", config_name="inference") 
 def main(config: DictConfig):
     # Print the entire configuration
     print(OmegaConf.to_yaml(config))

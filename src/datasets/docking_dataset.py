@@ -1,5 +1,6 @@
 import os
 import csv
+import esm
 import random
 import torch
 import torch.nn.functional as F
@@ -27,6 +28,21 @@ def random_rotation(rec_pos, lig_pos):
     lig_pos_out = pos[rec_pos.size(0):]
     return rec_pos_out, lig_pos_out
 
+def get_esm_attn(seq_prim, batch_converter, esm_model, device):
+    # Use ESM-1b format.
+    # The length of tokens is:
+    # L (sequence length) + 2 (start and end tokens)
+    seq = [
+        ("seq", seq_prim)
+    ]
+    out = batch_converter(seq)
+    with torch.no_grad():
+        results = esm_model(out[-1].to(device), repr_layers=[33], return_contacts=True)
+        attn = results["attentions"].squeeze(0)[:, :, 1:-1, 1:-1].cpu()
+        output = attn.permute(2, 3, 0, 1).flatten(2, 3)
+
+    return output
+
 #----------------------------------------------------------------------------
 # Dataset class
 
@@ -36,18 +52,31 @@ class DockingDataset(Dataset):
         dataset: str,
         training: bool = True,
         use_esm: bool = True,
+        use_attn: bool = False,
     ):
         self.dataset = dataset 
         self.training = training
         self.use_esm = use_esm
+        self.use_attn = use_attn
+
+        if self.use_attn:
+            # Load esm
+            self.esm_model, alphabet = esm.pretrained.load_model_and_alphabet('/home/lchu11/.cache/torch/hub/checkpoints/esm2_t33_650M_UR50D.pt')
+            self.batch_converter = alphabet.get_batch_converter()
+            self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+            self.esm_model = self.esm_model.to(self.device).eval()
 
         if dataset == 'dips_train':
-            self.data_dir = "/scratch4/jgray21/lchu11/data/dips/pt"
+            self.data_dir = "/scratch4/jgray21/lchu11/data/dips/pt_clean"
             self.data_list = "/scratch4/jgray21/lchu11/data/dips/data_list/diffdock-pp/train.txt" 
 
         elif dataset == 'dips_val':
-            self.data_dir = "/scratch4/jgray21/lchu11/data/dips/pt"
+            self.data_dir = "/scratch4/jgray21/lchu11/data/dips/pt_clean"
             self.data_list = "/scratch4/jgray21/lchu11/data/dips/data_list/diffdock-pp/val.txt" 
+
+        elif dataset == 'dips_testing':
+            self.data_dir = "/scratch4/jgray21/lchu11/data/dips/pt_clean"
+            self.data_list = "/scratch4/jgray21/lchu11/data/dips/data_list/diffdock-pp/testing.txt" 
 
         elif dataset == 'dips_train_hetero':
             self.data_dir = "/scratch4/jgray21/lchu11/data/pt/dips_bb"
@@ -100,28 +129,57 @@ class DockingDataset(Dataset):
             rec_x = rec_onehot
             lig_x = lig_onehot
 
+        if self.use_attn:
+            seq = rec_seq + lig_seq
+            attn = get_esm_attn(seq, self.batch_converter, self.esm_model, self.device)
+
         # Shuffle and Crop for training
         if self.training:
             # Shuffle the order of rec and lig
             vars_list = [(rec_x, rec_seq, rec_pos), (lig_x, lig_seq, lig_pos)]
-            random.shuffle(vars_list)
-            rec_x, rec_seq, rec_pos = vars_list[0]
-            lig_x, lig_seq, lig_pos = vars_list[1]
 
+            if random.random() > 0.5:
+                if self.use_attn:
+                    n = rec_x.size(0)
+                    attn_upper_left = attn[:n, :n]
+                    attn_upper_right = attn[:n, n:]
+                    attn_lower_left = attn[n:, :n]
+                    attn_lower_right = attn[n:, n:]
+                    attn_upper = torch.cat([attn_lower_right, attn_lower_left], dim=1)
+                    attn_lower = torch.cat([attn_upper_right, attn_upper_left], dim=1)
+                    attn = torch.cat([attn_upper, attn_lower], dim=0)
+
+                rec_x, rec_seq, rec_pos = vars_list[1]
+                lig_x, lig_seq, lig_pos = vars_list[0]
 
         # Random rotation augmentation
         rec_pos, lig_pos = random_rotation(rec_pos, lig_pos)
 
-        # Output
-        output = {
-            'id': _id,
-            'rec_seq': rec_seq,
-            'lig_seq': lig_seq,
-            'rec_x': rec_x,
-            'lig_x': lig_x,
-            'rec_pos': rec_pos,
-            'lig_pos': lig_pos,
-        }
+        if self.use_attn:
+            # Output
+            output = {
+                'id': _id,
+                'rec_seq': rec_seq,
+                'lig_seq': lig_seq,
+                'rec_x': rec_x,
+                'lig_x': lig_x,
+                'rec_pos': rec_pos,
+                'lig_pos': lig_pos,
+                'attn': attn,
+            }
+
+        else:
+            # Output
+            output = {
+                'id': _id,
+                'rec_seq': rec_seq,
+                'lig_seq': lig_seq,
+                'rec_x': rec_x,
+                'lig_x': lig_x,
+                'rec_pos': rec_pos,
+                'lig_pos': lig_pos,
+            }
+
         
         return {key: value for key, value in output.items()}
 
@@ -139,6 +197,7 @@ class DockingDataModule(pl.LightningDataModule):
         val_set: str = 'dips_val',
         batch_size: int = 1,
         use_esm: bool = True,
+        use_attn: bool = False,
         **kwargs
     ):
         super().__init__()
@@ -146,6 +205,7 @@ class DockingDataModule(pl.LightningDataModule):
         self.val_set = val_set
         self.batch_size = batch_size
         self.use_esm = use_esm
+        self.use_attn = use_attn
         self.num_workers = kwargs['num_workers']
         self.pin_memory = kwargs['pin_memory']
 
@@ -159,10 +219,12 @@ class DockingDataModule(pl.LightningDataModule):
         self.data_train = DockingDataset(
             dataset=self.train_set,
             use_esm=self.use_esm,
+            use_attn=self.use_attn,
         )
         self.data_val = DockingDataset(
             dataset=self.val_set,
             use_esm=self.use_esm,
+            use_attn=self.use_attn,
         )
 
     def train_dataloader(self):
@@ -185,7 +247,7 @@ class DockingDataModule(pl.LightningDataModule):
 
 
 if __name__ == '__main__':
-    dataset = DockingDataset(dataset='dips_train_hetero')
+    dataset = DockingDataset(dataset='dips_train')
     print(dataset[0])
     """
     dataloader = DataLoader(dataset, batch_size=1, num_workers=6)

@@ -282,3 +282,47 @@ def axis_angle_to_rotation_6d(axis_angle):
 
 def rotation_6d_to_axis_angle(rotation_6d):
     return matrix_to_axis_angle(rotation_6d_to_matrix(rotation_6d))
+
+def vector_to_skew_matrix(vectors: torch.Tensor) -> torch.Tensor:
+    """
+    Map a vector into the corresponding skew matrix so(3) basis.
+    ```
+                [  0 -z  y]
+    [x,y,z] ->  [  z  0 -x]
+                [ -y  x  0]
+    ```
+
+    Args:
+        vectors (torch.Tensor): Batch of vectors to be mapped to skew matrices.
+
+    Returns:
+        torch.Tensor: Vectors in skew matrix representation.
+    """
+    # Generate empty skew matrices.
+    skew_matrices = torch.zeros((*vectors.shape, 3), device=vectors.device, dtype=vectors.dtype)
+
+    # Populate positive values.
+    skew_matrices[..., 2, 1] = vectors[..., 0]
+    skew_matrices[..., 0, 2] = vectors[..., 1]
+    skew_matrices[..., 1, 0] = vectors[..., 2]
+
+    # Generate skew symmetry.
+    skew_matrices = skew_matrices - skew_matrices.transpose(-2, -1)
+
+    return skew_matrices
+
+def skew_matrix_to_vector(skew_matrices: torch.Tensor) -> torch.Tensor:
+    """
+    Extract a rotation vector from the so(3) skew matrix basis.
+
+    Args:
+        skew_matrices (torch.Tensor): Skew matrices.
+
+    Returns:
+        torch.Tensor: Rotation vectors corresponding to skew matrices.
+    """
+    vectors = torch.zeros_like(skew_matrices[..., 0])
+    vectors[..., 0] = skew_matrices[..., 2, 1]
+    vectors[..., 1] = skew_matrices[..., 0, 2]
+    vectors[..., 2] = skew_matrices[..., 1, 0]
+    return vectors

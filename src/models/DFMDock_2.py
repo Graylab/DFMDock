@@ -5,18 +5,17 @@ import torch.nn as nn
 import torch.nn.functional as F
 import pytorch_lightning as pl
 import numpy as np
-import random
 from torch.utils import data
 from torch_geometric.loader import DataLoader
 from omegaconf import DictConfig
 from datasets.pinder_dataset import PinderDataset
 from datasets.docking_dataset import DockingDataset
-from models.egnn_net import EGNN_Net
+from models.egnn_net_2 import EGNN_Net
 from utils.so3_diffuser import SO3Diffuser 
 from utils.r3_diffuser import R3Diffuser 
-from utils.geometry import axis_angle_to_matrix, vector_to_skew_matrix
+from utils.geometry import axis_angle_to_matrix
 from utils.crop import get_crop_idxs, get_crop, get_position_matrix
-from utils.loss import get_tm_loss
+from utils.loss import distogram_loss
 
 #----------------------------------------------------------------------------
 # Main wrapper for training the model
@@ -34,13 +33,13 @@ class DFMDock(pl.LightningModule):
         self.weight_decay = experiment.weight_decay
 
         # crop size
-        self.crop_size = experiment.crop_size
+        self.crop_size = 1200
 
         # confidence model
         self.use_confidence_loss = experiment.use_confidence_loss
 
-        # contact model
-        self.use_contact_loss = experiment.use_contact_loss
+        # dist model
+        self.use_dist_loss = experiment.use_dist_loss
 
         # interface residue model
         self.use_interface_loss = experiment.use_interface_loss
@@ -110,9 +109,9 @@ class DFMDock(pl.LightningModule):
             # get crop_idxs
             crop_idxs = get_crop_idxs(batch_gt, crop_size=self.crop_size)
             
-            # crop
-            batch = get_crop(batch, crop_idxs)
-            batch_gt = get_crop(batch_gt, crop_idxs)
+            # pre crop
+            #batch = get_crop(batch, crop_idxs)
+            #batch_gt = get_crop(batch_gt, crop_idxs)
 
             # noised pose          
             batch["lig_pos"] = self.modify_coords(batch["lig_pos"], rot_update, tr_update)
@@ -123,6 +122,10 @@ class DFMDock(pl.LightningModule):
             # move lig center to origin
             self.move_to_lig_center(batch)
             self.move_to_lig_center(batch_gt)
+
+            # post crop
+            batch = get_crop(batch, crop_idxs)
+            batch_gt = get_crop(batch_gt, crop_idxs)
         
         # predict score based on the current state
         if self.grad_energy:
@@ -209,12 +212,11 @@ class DFMDock(pl.LightningModule):
 
         bce_logits_loss = nn.BCEWithLogitsLoss()
         # contact loss
-        if self.use_contact_loss:
+        if self.use_dist_loss:
             gt_dist = torch.norm((batch_gt["rec_pos"][:, None, 1, :] - batch_gt["lig_pos"][None, :, 1, :]), dim=-1, keepdim=True)
-            gt_contact = torch.where(gt_dist < 8.0, 1.0, 0.0)
-            contact_loss = bce_logits_loss(outputs["contact_logits"], gt_contact)
+            dist_loss = distogram_loss(outputs["dist_logits"], gt_dist)
         else:
-            contact_loss = torch.tensor(0.0, device=self.device)
+            dist_loss = torch.tensor(0.0, device=self.device)
 
         # interface loss
         if self.use_interface_loss:
@@ -231,13 +233,13 @@ class DFMDock(pl.LightningModule):
             conf_loss = torch.tensor(0.0, device=self.device)
 
         # total losses
-        loss = tr_loss + rot_loss + ec_loss + el_loss + contact_loss + ires_loss + conf_loss
+        loss = tr_loss + rot_loss + ec_loss + el_loss + dist_loss * 0.1 + ires_loss + conf_loss * 0.1
         losses = {
             "tr_loss": tr_loss, 
             "rot_loss": rot_loss, 
             "ec_loss": ec_loss, 
             "el_loss": el_loss, 
-            "contact_loss": contact_loss, 
+            "dist_loss": dist_loss, 
             "ires_loss": ires_loss,
             "conf_loss": conf_loss,
             "loss": loss,
@@ -352,7 +354,7 @@ def get_rmsd(pred, label):
 #----------------------------------------------------------------------------
 # Testing run
 
-@hydra.main(version_base=None, config_path="/scratch4/jgray21/lchu11/graylab_repos/DFMDock/configs/model", config_name="DFMDock.yaml")
+@hydra.main(version_base=None, config_path="/scratch4/jgray21/lchu11/graylab_repos/DFMDock/configs/model", config_name="DFMDock_2.yaml")
 def main(conf: DictConfig):
     #dataset = PinderDataset(
     #    data_dir='/scratch4/jgray21/lchu11/data/pinder/train',

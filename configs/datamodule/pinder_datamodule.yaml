@@ -3,4 +3,4 @@ _target_: datasets.pinder_dataset.PinderDataModule
 batch_size: 1
 use_esm: True
 num_workers: 12
-pin_memory: False
+pin_memory: True

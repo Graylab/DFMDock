@@ -25,18 +25,14 @@ class ModelConfig:
     cut_off: float = 20.0
     normalize: bool = True
     agg: str = 'mean'
-    crop_size: int = 800
 
 #----------------------------------------------------------------------------
 # Helper functions
 
-def modulate(x, shift, scale):
-    return x * (1 + scale) + shift
-
 def get_spatial_matrix(coord):
     dist, omega, theta, phi = get_coords6d(coord)
 
-    mask = dist < 22.0
+    mask = dist < 20.0
     
     num_dist_bins = 40
     num_omega_bins = 24
@@ -204,7 +200,6 @@ class TimestepEmbedder(nn.Module):
         t_emb = self.mlp(t_freq)
         return t_emb
 
-
 class GaussianFourierProjection(nn.Module):
     """Gaussian random features for encoding time steps."""  
     def __init__(self, embed_dim, scale=1.):
@@ -248,17 +243,8 @@ class EGNNLayer(nn.Module):
             dropout=dropout,
         )
 
-        self.norm = nn.LayerNorm(node_dim, elementwise_affine=False, eps=1e-6)
-        self.adaLN_modulation = nn.Sequential(
-            nn.SiLU(),
-            nn.Linear(node_dim, 3 * node_dim, bias=True)
-        )
-
-    def forward(self, h, x, edges, t, edge_attr=None, lig_mask=None):
-        shift_mlp, scale_mlp, gate_mlp = self.adaLN_modulation(t).chunk(3, dim=1)
-        h_in = modulate(self.norm(h), shift_mlp, scale_mlp)
-        h_in, x, edge_attr = self.egcl(h_in, edges, x, edge_attr=edge_attr, lig_mask=lig_mask)
-        h = h + gate_mlp * h_in 
+    def forward(self, h, x, edges, edge_attr=None, lig_mask=None):
+        h, x, edge_attr = self.egcl(h, edges, x, edge_attr=edge_attr, lig_mask=lig_mask)
         return h, x, edge_attr
 
 
@@ -278,7 +264,6 @@ class EGNN(nn.Module):
         super(EGNN, self).__init__()
         self.depth = depth
         for i in range(depth):
-            is_last = i == depth - 1
             self.add_module("EGNN_%d" % i, EGNNLayer(
                 node_dim=node_dim, 
                 edge_dim=edge_dim,
@@ -288,29 +273,14 @@ class EGNN(nn.Module):
                 normalize=normalize, 
                 tanh=tanh,
                 dropout=dropout,
-                update_coords=is_last,
+                update_coords=False,
             )
         )
-            
-        self.t_embedder = TimestepEmbedder(node_dim)
 
-        self.initialize_weights()
-            
-    def initialize_weights(self):
-        # Initialize timestep embedding MLP:
-        nn.init.normal_(self.t_embedder.mlp[0].weight, std=0.02)
-        nn.init.normal_(self.t_embedder.mlp[2].weight, std=0.02)
-
+    def forward(self, h, x, edges, edge_attr=None, lig_mask=None):
         for i in range(self.depth):
-            block = self._modules["EGNN_%d" % i] 
-            nn.init.constant_(block.adaLN_modulation[-1].weight, 0)
-            nn.init.constant_(block.adaLN_modulation[-1].bias, 0)
-
-    def forward(self, h, x, edges, t, edge_attr=None, lig_mask=None):
-        t = self.t_embedder(t)
-        for i in range(self.depth):
-            h, x, edge_attr = self._modules["EGNN_%d" % i](h, x, edges, t, edge_attr=edge_attr, lig_mask=lig_mask)
-        return h, x, edge_attr
+            h, x, edge_attr = self._modules["EGNN_%d" % i](h, x, edges, edge_attr=edge_attr, lig_mask=lig_mask)
+        return h
 
 
 #----------------------------------------------------------------------------
@@ -358,14 +328,44 @@ class EGNN_Net(nn.Module):
 
         # energy head
         self.to_energy = nn.Sequential(
-            nn.Linear(2*node_dim, node_dim, bias=False),
+            nn.Linear(2*node_dim + 1, node_dim, bias=False),
             nn.LayerNorm(node_dim),
             nn.SiLU(),
             nn.Linear(node_dim, 1, bias=False),
         )
 
-        # tm score head
-        self.to_tm_logits = nn.Linear(2*node_dim, 64) 
+        # force head 
+        self.to_force = nn.Sequential(
+            nn.Linear(2*node_dim + 1, node_dim, bias=False),
+            nn.LayerNorm(node_dim),
+            nn.SiLU(),
+            nn.Linear(node_dim, 1, bias=False),
+        )
+
+        # dist head
+        self.to_dist = nn.Sequential(
+            nn.Linear(2*node_dim + 1, node_dim, bias=False),
+            nn.LayerNorm(node_dim),
+            nn.SiLU(),
+            nn.Linear(node_dim, 64, bias=False),
+        )
+
+        # confidence head
+        self.to_confidence = nn.Sequential(
+            nn.Linear(2*node_dim + 1, node_dim, bias=False),
+            nn.LayerNorm(node_dim),
+            nn.SiLU(),
+            nn.Linear(node_dim, 1, bias=False),
+        )
+
+        # interface residue head
+        self.to_ires = nn.Sequential(
+            nn.Linear(node_dim, 2*node_dim),
+            nn.SiLU(),
+            nn.Linear(2*node_dim, 2*node_dim),
+            nn.SiLU(),
+            nn.Linear(2*node_dim, 1),
+        )
 
         # timestep embedding
         self.t_embed = nn.Sequential(
@@ -393,6 +393,17 @@ class EGNN_Net(nn.Module):
             nn.Linear(inner_dim, 1, bias=False),
             nn.Softplus()
         )
+
+        self.apply(self._init_weights)
+
+    def _init_weights(self, module):
+        if isinstance(module, nn.Linear):
+            module.weight.data.normal_(mean=0.0, std=0.02)
+            if module.bias is not None:
+                module.bias.data.zero_()
+        elif isinstance(module, nn.LayerNorm):
+            module.bias.data.zero_()
+            module.weight.data.fill_(1.0)
         
     def forward(self, batch, predict=False, return_energy=False):
         # get inputs
@@ -403,54 +414,59 @@ class EGNN_Net(nn.Module):
         position_matrix = batch["position_matrix"]
         t = batch["t"]
 
-        # get the current complex pose
+        # get ca distance matrix 
+        vec = rec_pos[:, None, 1, :] - lig_pos[None, :, 1, :] 
+        unit_vec = F.normalize(vec, dim=-1)
+        D = torch.norm(vec, dim=-1)
+        
+        # get current complex pose
         lig_pos.requires_grad_()
         pos = torch.cat([rec_pos, lig_pos], dim=0)
-
-        # get ca distance matrix 
-        D = torch.norm((rec_pos[:, None, 1, :] - lig_pos[None, :, 1, :]), dim=-1)
 
         # node feature embedding
         x = torch.cat([rec_x, lig_x], dim=0)
         node = self.single_embed(x) # [n, c]
 
         # edge feature embedding
-        spatial_matrix = get_pairs(pos)
+        spatial_matrix = get_spatial_matrix(pos)
         edge = self.spatial_embed(spatial_matrix) + self.positional_embed(position_matrix)
 
         # sample edge_index and get edge_attr
         edge_index, edge_attr = get_knn_and_sample_graph(pos[..., 1, :], edge)
 
-        # get ligand mask
-        lig_mask = torch.zeros(x.size(0), device=x.device)
-        lig_mask[rec_x.size(0):] = 1.0
-
         # main network 
-        node_out, pos_out, _ = self.network(node, pos[..., 1, :], edge_index, t.repeat(x.size(0)), edge_attr, lig_mask) # [R+L, H]
+        node = self.network(node, pos[..., 1, :], edge_index, edge_attr) # [R+L, H]
 
         # energy
-        h_rec = repeat(node_out[:rec_pos.size(0)], 'n h -> n m h', m=lig_pos.size(0))
-        h_lig = repeat(node_out[rec_pos.size(0):], 'm h -> n m h', n=rec_pos.size(0))
-        interaction = torch.cat([h_rec, h_lig], dim=-1)
+        h_rec = repeat(node[:rec_pos.size(0)], 'n h -> n m h', m=lig_pos.size(0))
+        h_lig = repeat(node[rec_pos.size(0):], 'm h -> n m h', n=rec_pos.size(0))
+        interaction = torch.cat([h_rec, h_lig, D.unsqueeze(-1)], dim=-1)
         energy = self.to_energy(interaction).squeeze(-1) # [R, L]
         mask_2D = (D < self.cut_off).float() # [R, L]
-        energy = (energy * mask_2D).sum() / (mask_2D.sum() + 1e-6) 
 
         if self.agg == 'mean':
-            energy = (energy * mask_2D).sum() / (mask_2D.sum() + 1e-6) 
+            energy = (energy * mask_2D).sum() / mask_2D.sum().clamp(min=1)
         else:
             energy = (energy * mask_2D).sum() 
 
         if return_energy:
             return energy
 
-        # tm score head
-        tm_logits = self.to_tm_logits(interaction.detach())
+        # confidence head
+        confidence_logits = self.to_confidence(interaction).mean()
+
+        # contact head
+        dist_logits = self.to_dist(interaction)
+
+        # interface residue head
+        ires_logits = self.to_ires(node)
 
         # force
-        lig_pos_curr = pos_out[rec_pos.size(0):] 
-        r = lig_pos[..., 1, :].detach()
-        f = lig_pos_curr - r # f / kT
+        fij = unit_vec * self.to_force(interaction) 
+        if self.agg == 'mean':
+            f = fij.mean(dim=0)
+        else:
+            f = fij.sum(dim=0)
 
         # translation
         if self.agg == 'mean':
@@ -459,6 +475,7 @@ class EGNN_Net(nn.Module):
             tr_pred = f.sum(dim=0, keepdim=True)
 
         # rotation
+        r = lig_pos[..., 1, :].detach()
         if self.agg == 'mean':
             rot_pred = torch.cross(r, f, dim=-1).mean(dim=0, keepdim=True)
         else:
@@ -480,7 +497,9 @@ class EGNN_Net(nn.Module):
                 "energy": energy,
                 "f": f,
                 "num_clashes": num_clashes,
-                "tm_logits": tm_logits,
+                "dist_logits": dist_logits,
+                "ires_logits": ires_logits,
+                "confidence_logits": confidence_logits,
             }
 
             return outputs
@@ -504,7 +523,9 @@ class EGNN_Net(nn.Module):
             "energy": energy,
             "f": f,
             "dedx": dedx,
-            "tm_logits": tm_logits,
+            "dist_logits": dist_logits,
+            "ires_logits": ires_logits,
+            "confidence_logits": confidence_logits,
         }
 
         return outputs
@@ -516,7 +537,7 @@ if __name__ == '__main__':
     conf = ModelConfig(
         lm_embed_dim=1280,
         positional_embed_dim=66,
-        spatial_embed_dim=25,
+        spatial_embed_dim=100,
         node_dim=24,
         edge_dim=12,
         inner_dim=24,

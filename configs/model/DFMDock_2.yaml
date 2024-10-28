@@ -1,4 +1,4 @@
-_target_: models.DFMDock.DFMDock
+_target_: models.DFMDock_2.DFMDock
 
 model:
   lm_embed_dim: 1301 # 1280 (ESM) + 21 (One-Hot) 
@@ -30,7 +30,6 @@ diffuser:
 experiment:
   lr: 1e-4
   weight_decay: 0.0
-  crop_size: 1200
   perturb_tr: True
   perturb_rot: True
   separate_energy_loss: True
@@ -38,7 +37,7 @@ experiment:
   separate_rot_loss: True
   grad_energy: False
   use_contrastive_loss: False
-  use_contact_loss: False
+  use_dist_loss: True
   use_interface_loss: False
   use_confidence_loss: False
 

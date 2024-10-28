@@ -14,9 +14,8 @@ from datasets.docking_dataset import DockingDataset
 from models.egnn_net import EGNN_Net
 from utils.so3_diffuser import SO3Diffuser 
 from utils.r3_diffuser import R3Diffuser 
-from utils.geometry import axis_angle_to_matrix, vector_to_skew_matrix
+from utils.geometry import axis_angle_to_matrix
 from utils.crop import get_crop_idxs, get_crop, get_position_matrix
-from utils.loss import get_tm_loss
 
 #----------------------------------------------------------------------------
 # Main wrapper for training the model
@@ -123,6 +122,27 @@ class DFMDock(pl.LightningModule):
             # move lig center to origin
             self.move_to_lig_center(batch)
             self.move_to_lig_center(batch_gt)
+
+            # get gt contact
+            gt_dist = torch.norm((batch_gt["rec_pos"][:, None, 1, :] - batch_gt["lig_pos"][None, :, 1, :]), dim=-1, keepdim=True)
+            gt_contact = torch.where(gt_dist < 8.0, 1.0, 0.0)
+            if random.random() < 0.1:
+                contact_matrix = get_contact_matrix(gt_contact, num_samples=random.randint(0, 3)).unsqueeze(-1)
+            else:
+                n = gt_contact.size(0) + gt_contact.size(1)
+                contact_matrix = torch.zeros((n, n), device=self.device).unsqueeze(-1)
+                
+            batch["position_matrix"] = torch.cat([batch["position_matrix"], contact_matrix], dim=-1)
+
+            # get gt interface
+            gt_ires = get_interface_residue_tensors(batch_gt["rec_pos"][:, 1, :], batch_gt["lig_pos"][:, 1, :])
+            if random.random() < 0.1:
+                ires = randomly_mask_ones(gt_ires)
+            else:
+                ires = torch.zeros_like(gt_ires)
+
+            batch["rec_x"] = torch.cat([batch["rec_x"], ires[:gt_contact.size(0)]], dim=-1)
+            batch["lig_x"] = torch.cat([batch["lig_x"], ires[gt_contact.size(0):]], dim=-1)
         
         # predict score based on the current state
         if self.grad_energy:
@@ -210,15 +230,12 @@ class DFMDock(pl.LightningModule):
         bce_logits_loss = nn.BCEWithLogitsLoss()
         # contact loss
         if self.use_contact_loss:
-            gt_dist = torch.norm((batch_gt["rec_pos"][:, None, 1, :] - batch_gt["lig_pos"][None, :, 1, :]), dim=-1, keepdim=True)
-            gt_contact = torch.where(gt_dist < 8.0, 1.0, 0.0)
             contact_loss = bce_logits_loss(outputs["contact_logits"], gt_contact)
         else:
             contact_loss = torch.tensor(0.0, device=self.device)
 
         # interface loss
         if self.use_interface_loss:
-            gt_ires = get_interface_residue_tensors(batch_gt["rec_pos"][:, 1, :], batch_gt["lig_pos"][:, 1, :])
             ires_loss = bce_logits_loss(outputs["ires_logits"], gt_ires)
         else:
             ires_loss = torch.tensor(0.0, device=self.device)
@@ -322,6 +339,7 @@ class DFMDock(pl.LightningModule):
         )
         return optimizer
 
+#----------------------------------------------------------------------------
 # helper functions
 
 def get_interface_residue_tensors(set1, set2, threshold=8.0):
@@ -348,11 +366,68 @@ def get_interface_residue_tensors(set1, set2, threshold=8.0):
 def get_rmsd(pred, label):
     rmsd = torch.sqrt(torch.mean(torch.sum((pred - label) ** 2.0, dim=-1)))
     return rmsd
+    
+def randomly_mask_ones(tensor, n=4):
+    # Get the indices of all the ones in the tensor
+    one_indices = torch.nonzero(tensor == 1).squeeze()
 
+    # Get the total number of ones in the tensor
+    num_ones = one_indices.size(0)
+
+    if num_ones == 0:
+        # Return the tensor as is if there are no ones
+        return tensor
+    
+    # Randomly shuffle the indices of the ones
+    perm = torch.randperm(num_ones)
+
+    # Select a number between 1 and the smaller of 4 or the total number of ones
+    num_ones_to_keep = torch.randint(1, min(n, num_ones) + 1, (1,)).item()
+
+    # Keep only the first `num_ones_to_keep` ones
+    indices_to_keep = one_indices[perm[:num_ones_to_keep]]
+
+    # Create a mask that zeros out all other ones
+    masked_tensor = torch.zeros_like(tensor)
+    masked_tensor[indices_to_keep[:, 0], indices_to_keep[:, 1]] = 1
+
+    return masked_tensor
+
+def get_contact_matrix(contact_pairs, num_samples=None):
+    """
+    Constructs a contact matrix for two sets of residues with 1 indicating sampled contact pairs.
+    
+    :param num_samples: Number of contact pairs to sample. If None, use all valid contacts.
+    :return: PyTorch tensor of shape [(n1+n2), (n1+n2)] representing the contact matrix with sampled contact pairs
+    """
+    device = contact_pairs.device
+    n1 = contact_pairs.size(0)
+    n2 = contact_pairs.size(1)
+    
+    # Get indices of valid contact pairs
+    contact_indices = contact_pairs.nonzero(as_tuple=False)
+    
+    # Initialize the contact matrix with zeros
+    contact_matrix = torch.zeros((n1 + n2, n1 + n2), device=device)
+
+    # Determine the number of samples
+    if num_samples is None or num_samples > contact_indices.size(0):
+        num_samples = contact_indices.size(0)
+    
+    if num_samples > 0:
+        # Sample contact indices uniformly
+        sampled_indices = contact_indices[torch.randint(0, contact_indices.size(0), (num_samples,))]
+        
+        # Fill in the contact matrix for the sampled contacts
+        contact_matrix[sampled_indices[:, 0], sampled_indices[:, 1] + n1] = 1.0
+        contact_matrix[sampled_indices[:, 1] + n1, sampled_indices[:, 0]] = 1.0
+    
+    return contact_matrix
+    
 #----------------------------------------------------------------------------
 # Testing run
 
-@hydra.main(version_base=None, config_path="/scratch4/jgray21/lchu11/graylab_repos/DFMDock/configs/model", config_name="DFMDock.yaml")
+@hydra.main(version_base=None, config_path="/scratch4/jgray21/lchu11/graylab_repos/DFMDock/configs/model", config_name="DFMDock_guide.yaml")
 def main(conf: DictConfig):
     #dataset = PinderDataset(
     #    data_dir='/scratch4/jgray21/lchu11/data/pinder/train',

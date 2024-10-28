@@ -1,3 +1,4 @@
+import esm
 import copy
 import hydra
 import torch
@@ -9,19 +10,17 @@ import random
 from torch.utils import data
 from torch_geometric.loader import DataLoader
 from omegaconf import DictConfig
-from datasets.pinder_dataset import PinderDataset
-from datasets.docking_dataset import DockingDataset
-from models.egnn_net import EGNN_Net
+from models.score_net_mlsb import Score_Net
 from utils.so3_diffuser import SO3Diffuser 
 from utils.r3_diffuser import R3Diffuser 
-from utils.geometry import axis_angle_to_matrix, vector_to_skew_matrix
-from utils.crop import get_crop_idxs, get_crop, get_position_matrix
-from utils.loss import get_tm_loss
+from utils.geometry import axis_angle_to_matrix
+from datasets.ppi_mlsb_dataset import PPIDataset
+from datasets.pinder_dataset import PinderDataset
 
 #----------------------------------------------------------------------------
 # Main wrapper for training the model
 
-class DFMDock(pl.LightningModule):
+class Score_Model(pl.LightningModule):
     def __init__(
         self,
         model,
@@ -33,22 +32,9 @@ class DFMDock(pl.LightningModule):
         self.lr = experiment.lr
         self.weight_decay = experiment.weight_decay
 
-        # crop size
-        self.crop_size = experiment.crop_size
-
-        # confidence model
-        self.use_confidence_loss = experiment.use_confidence_loss
-
-        # contact model
-        self.use_contact_loss = experiment.use_contact_loss
-
-        # interface residue model
-        self.use_interface_loss = experiment.use_interface_loss
-
         # energy
         self.grad_energy = experiment.grad_energy
         self.separate_energy_loss = experiment.separate_energy_loss
-        self.use_contrastive_loss = experiment.use_contrastive_loss
         
         # translation
         self.perturb_tr = experiment.perturb_tr
@@ -58,6 +44,12 @@ class DFMDock(pl.LightningModule):
         self.perturb_rot = experiment.perturb_rot
         self.separate_rot_loss = experiment.separate_rot_loss
 
+        # interface 
+        self.use_interface_loss = experiment.use_interface_loss
+
+        # contrastive
+        self.use_contrastive_loss = experiment.use_contrastive_loss
+
         # diffuser
         if self.perturb_tr:
             self.r3_diffuser = R3Diffuser(diffuser.r3)
@@ -65,14 +57,21 @@ class DFMDock(pl.LightningModule):
             self.so3_diffuser = SO3Diffuser(diffuser.so3)
 
         # net
-        self.net = EGNN_Net(model)
+        self.net = Score_Net(model)
     
     def forward(self, batch):
-        # move lig center to origin
-        self.move_to_lig_center(batch)
+        # grab some input 
+        rec_pos = batch["rec_pos"]
+        lig_pos = batch["lig_pos"]
 
-        # get position matrix
-        batch = get_position_matrix(batch)
+        # move lig center to origin
+        center = lig_pos[..., 1, :].mean(dim=0)
+        rec_pos -= center
+        lig_pos -= center
+
+        # push to batch
+        batch["rec_pos"] = rec_pos
+        batch["lig_pos"] = lig_pos
 
         # predict
         outputs = self.net(batch, predict=True)
@@ -80,6 +79,10 @@ class DFMDock(pl.LightningModule):
         return outputs
 
     def loss_fn(self, batch, eps=1e-5):
+        # grab some input 
+        rec_pos = batch["rec_pos"]
+        lig_pos = batch["lig_pos"]
+
         with torch.no_grad():
             # uniformly sample a timestep
             t = torch.rand(1, device=self.device) * (1. - eps) + eps
@@ -107,22 +110,20 @@ class DFMDock(pl.LightningModule):
             # save gt state
             batch_gt = copy.deepcopy(batch)
 
-            # get crop_idxs
-            crop_idxs = get_crop_idxs(batch_gt, crop_size=self.crop_size)
-            
-            # crop
-            batch = get_crop(batch, crop_idxs)
-            batch_gt = get_crop(batch_gt, crop_idxs)
-
-            # noised pose          
-            batch["lig_pos"] = self.modify_coords(batch["lig_pos"], rot_update, tr_update)
+            # update poses          
+            lig_pos = self.modify_coords(lig_pos, rot_update, tr_update)
 
             # get LRMSD
-            l_rmsd = get_rmsd(batch["lig_pos"][..., 1, :], batch_gt["lig_pos"][..., 1, :])
+            l_rmsd = get_rmsd(lig_pos[..., 1, :], batch_gt["lig_pos"][..., 1, :])
 
             # move lig center to origin
-            self.move_to_lig_center(batch)
-            self.move_to_lig_center(batch_gt)
+            center = lig_pos[..., 1, :].mean(dim=0)
+            rec_pos -= center
+            lig_pos -= center
+
+            # save noised state
+            batch["rec_pos"] = rec_pos
+            batch["lig_pos"] = lig_pos
         
         # predict score based on the current state
         if self.grad_energy:
@@ -160,7 +161,7 @@ class DFMDock(pl.LightningModule):
             # energy conservation loss
             ec_loss = torch.tensor(0.0, device=self.device)
 
-        mse_loss_fn = nn.MSELoss()
+
         # translation loss
         if self.perturb_tr:
             if self.separate_tr_loss:
@@ -197,6 +198,13 @@ class DFMDock(pl.LightningModule):
         else:
             rot_loss = torch.tensor(0.0, device=self.device)
         
+        # interface loss
+        bce_logits_loss = nn.BCEWithLogitsLoss()
+        if self.use_interface_loss:
+            ires_loss = bce_logits_loss(outputs['ires'], batch['ires'])
+        else:
+            ires_loss = torch.tensor(0.0, device=self.device)
+
         # contrastive loss
         # modified from https://github.com/yilundu/ired_code_release/blob/main/diffusion_lib/denoising_diffusion_pytorch_1d.py
         if self.use_contrastive_loss:
@@ -205,64 +213,34 @@ class DFMDock(pl.LightningModule):
             target = torch.zeros([], device=energy_stack.device)
             el_loss = F.cross_entropy(-1 * energy_stack, target.long(), reduction='none')
         else: 
-            el_loss = torch.tensor(0.0, device=self.device)
+            el_loss = torch.tensor(0.0, device=self.device) 
 
-        bce_logits_loss = nn.BCEWithLogitsLoss()
-        # contact loss
-        if self.use_contact_loss:
-            gt_dist = torch.norm((batch_gt["rec_pos"][:, None, 1, :] - batch_gt["lig_pos"][None, :, 1, :]), dim=-1, keepdim=True)
-            gt_contact = torch.where(gt_dist < 8.0, 1.0, 0.0)
-            contact_loss = bce_logits_loss(outputs["contact_logits"], gt_contact)
-        else:
-            contact_loss = torch.tensor(0.0, device=self.device)
-
-        # interface loss
-        if self.use_interface_loss:
-            gt_ires = get_interface_residue_tensors(batch_gt["rec_pos"][:, 1, :], batch_gt["lig_pos"][:, 1, :])
-            ires_loss = bce_logits_loss(outputs["ires_logits"], gt_ires)
-        else:
-            ires_loss = torch.tensor(0.0, device=self.device)
 
         # confidence loss
-        if self.use_confidence_loss:
-            label = (l_rmsd < 5.0).float()
-            conf_loss = bce_logits_loss(outputs["confidence_logits"], label)
-        else:
-            conf_loss = torch.tensor(0.0, device=self.device)
-
+        label = (l_rmsd < 5.0).float()
+        conf_loss = bce_logits_loss(energy_noised, label)
+        
         # total losses
-        loss = tr_loss + rot_loss + ec_loss + el_loss + contact_loss + ires_loss + conf_loss
-        losses = {
-            "tr_loss": tr_loss, 
-            "rot_loss": rot_loss, 
-            "ec_loss": ec_loss, 
-            "el_loss": el_loss, 
-            "contact_loss": contact_loss, 
-            "ires_loss": ires_loss,
-            "conf_loss": conf_loss,
-            "loss": loss,
-        }
+        loss = tr_loss + rot_loss + ec_loss + el_loss + ires_loss + conf_loss
+        losses = {"tr_loss": tr_loss, "rot_loss": rot_loss, "ec_loss": ec_loss, "el_loss": el_loss, "ires_loss": ires_loss, "conf_loss": conf_loss, "loss": loss}
 
         return losses
 
     def modify_coords(self, lig_pos, rot_update, tr_update):
-        cen = lig_pos.mean(dim=(0, 1))
+        cen = lig_pos[..., 1, :].mean(dim=0)
         rot = axis_angle_to_matrix(rot_update.squeeze())
         tr = tr_update.squeeze()
         lig_pos = (lig_pos - cen) @ rot.T + cen
         lig_pos = lig_pos + tr
         return lig_pos
 
-    def move_to_lig_center(self, batch):
-        center = batch["lig_pos"].mean(dim=(0, 1))
-        batch["rec_pos"] = batch["rec_pos"] - center
-        batch["lig_pos"] = batch["lig_pos"] - center
-
     def step(self, batch, batch_idx):
         rec_x = batch['rec_x'].squeeze(0)
         lig_x = batch['lig_x'].squeeze(0)
         rec_pos = batch['rec_pos'].squeeze(0)
         lig_pos = batch['lig_pos'].squeeze(0)
+        position_matrix = batch['position_matrix'].squeeze(0)
+        ires = batch['ires'].squeeze(0)
 
         # wrap to a batch
         batch = {
@@ -270,12 +248,20 @@ class DFMDock(pl.LightningModule):
             "lig_x": lig_x,
             "rec_pos": rec_pos,
             "lig_pos": lig_pos,
+            "position_matrix": position_matrix,
+            "ires": ires,
         }
 
         # get losses
         losses = self.loss_fn(batch)
         return losses
     
+    def get_esm_rep(self, out):
+        with torch.no_grad():
+            results = self.esm_model(out, repr_layers = [33])
+            rep = results["representations"][33]
+        return rep[0, :, :]
+
     def training_step(self, batch, batch_idx):
         losses = self.step(batch, batch_idx)
         for loss_name, indiv_loss in losses.items():
@@ -322,28 +308,8 @@ class DFMDock(pl.LightningModule):
         )
         return optimizer
 
-# helper functions
-
-def get_interface_residue_tensors(set1, set2, threshold=8.0):
-    device = set1.device
-    n1_len = set1.shape[0]
-    n2_len = set2.shape[0]
-    
-    # Calculate the Euclidean distance between each pair of points from the two sets
-    dists = torch.cdist(set1, set2)
-
-    # Find the indices where the distance is less than the threshold
-    close_points = dists < threshold
-
-    # Create indicator tensors initialized to 0
-    indicator_set1 = torch.zeros((n1_len, 1), device=device)
-    indicator_set2 = torch.zeros((n2_len, 1), device=device)
-
-    # Set the corresponding indices to 1 where the points are close
-    indicator_set1[torch.any(close_points, dim=1)] = 1.0
-    indicator_set2[torch.any(close_points, dim=0)] = 1.0
-
-    return torch.cat([indicator_set1, indicator_set2], dim=0)
+#----------------------------------------------------------------------------
+# Helpers
 
 def get_rmsd(pred, label):
     rmsd = torch.sqrt(torch.mean(torch.sum((pred - label) ** 2.0, dim=-1)))
@@ -352,19 +318,21 @@ def get_rmsd(pred, label):
 #----------------------------------------------------------------------------
 # Testing run
 
-@hydra.main(version_base=None, config_path="/scratch4/jgray21/lchu11/graylab_repos/DFMDock/configs/model", config_name="DFMDock.yaml")
+@hydra.main(version_base=None, config_path="/scratch4/jgray21/lchu11/graylab_repos/DFMDock/configs/model", config_name="score_model_mlsb.yaml")
 def main(conf: DictConfig):
+    dataset = PPIDataset(
+        dataset='dips_train',
+        crop_size=500,
+    )
+
     #dataset = PinderDataset(
     #    data_dir='/scratch4/jgray21/lchu11/data/pinder/train',
+    #    test_split='pinder_s',
     #    training=True,
     #    use_esm=True,
+    #    crop_size=800,
     #)
-    
-    dataset = DockingDataset(
-        dataset='dips_train',
-        training=True,
-        use_esm=True,
-    )
+
 
     subset_indices = [0]
     subset = data.Subset(dataset, subset_indices)
@@ -372,7 +340,7 @@ def main(conf: DictConfig):
     #load dataset
     dataloader = DataLoader(subset)
     
-    model = DFMDock(
+    model = Score_Model(
         model=conf.model, 
         diffuser=conf.diffuser,
         experiment=conf.experiment

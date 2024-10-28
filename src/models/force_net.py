@@ -2,12 +2,12 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
-import math
 from dataclasses import dataclass
 from einops import repeat
 from models.egnn import E_GCL
 from utils.coords6d import get_coords6d
-from utils.frame import get_pairs
+from utils.frame import get_rotat, get_trans, get_pairs
+from utils.geometry import skew_matrix_to_vector
 
 #----------------------------------------------------------------------------
 # Data class for model config
@@ -17,14 +17,14 @@ class ModelConfig:
     lm_embed_dim: int
     positional_embed_dim: int
     spatial_embed_dim: int
+    contact_embed_dim: int
     node_dim: int
     edge_dim: int
     inner_dim: int
     depth: int
     dropout: float = 0.0
-    cut_off: float = 20.0
-    normalize: bool = True
-    agg: str = 'mean'
+    cut_off: float = 30.0
+    normalize: bool = False
 
 #----------------------------------------------------------------------------
 # Helper functions
@@ -32,7 +32,7 @@ class ModelConfig:
 def get_spatial_matrix(coord):
     dist, omega, theta, phi = get_coords6d(coord)
 
-    mask = dist < 20.0
+    mask = dist < 22.0
     
     num_dist_bins = 40
     num_omega_bins = 24
@@ -44,7 +44,7 @@ def get_spatial_matrix(coord):
     phi_bin = get_bins(phi, 0.0, 180.0, num_phi_bins)
 
     def mask_mat(mat, num_bins):
-        mat[~mask] = num_bins - 1
+        mat[~mask] = 0
         mat.fill_diagonal_(0)
         return mat
 
@@ -161,45 +161,6 @@ def get_knn_and_sample_graph(x, e, knn=20, sample_size=40):
 #----------------------------------------------------------------------------
 # nn Modules
 
-class TimestepEmbedder(nn.Module):
-    """
-    Embeds scalar timesteps into vector representations.
-    """
-    def __init__(self, hidden_size, frequency_embedding_size=256):
-        super().__init__()
-        self.mlp = nn.Sequential(
-            nn.Linear(frequency_embedding_size, hidden_size, bias=True),
-            nn.SiLU(),
-            nn.Linear(hidden_size, hidden_size, bias=True),
-        )
-        self.frequency_embedding_size = frequency_embedding_size
-
-    @staticmethod
-    def timestep_embedding(t, dim, max_period=10000):
-        """
-        Create sinusoidal timestep embeddings.
-        :param t: a 1-D Tensor of N indices, one per batch element.
-                          These may be fractional.
-        :param dim: the dimension of the output.
-        :param max_period: controls the minimum frequency of the embeddings.
-        :return: an (N, D) Tensor of positional embeddings.
-        """
-        # https://github.com/openai/glide-text2im/blob/main/glide_text2im/nn.py
-        half = dim // 2
-        freqs = torch.exp(
-            -math.log(max_period) * torch.arange(start=0, end=half, dtype=torch.float32) / half
-        ).to(device=t.device)
-        args = t[:, None].float() * freqs[None]
-        embedding = torch.cat([torch.cos(args), torch.sin(args)], dim=-1)
-        if dim % 2:
-            embedding = torch.cat([embedding, torch.zeros_like(embedding[:, :1])], dim=-1)
-        return embedding
-
-    def forward(self, t):
-        t_freq = self.timestep_embedding(t, self.frequency_embedding_size)
-        t_emb = self.mlp(t_freq)
-        return t_emb
-
 class GaussianFourierProjection(nn.Module):
     """Gaussian random features for encoding time steps."""  
     def __init__(self, embed_dim, scale=1.):
@@ -264,7 +225,6 @@ class EGNN(nn.Module):
         super(EGNN, self).__init__()
         self.depth = depth
         for i in range(depth):
-            is_last = i == depth - 1
             self.add_module("EGNN_%d" % i, EGNNLayer(
                 node_dim=node_dim, 
                 edge_dim=edge_dim,
@@ -274,20 +234,20 @@ class EGNN(nn.Module):
                 normalize=normalize, 
                 tanh=tanh,
                 dropout=dropout,
-                update_coords=is_last,
+                update_coords=False,
             )
         )
 
     def forward(self, h, x, edges, edge_attr=None, lig_mask=None):
         for i in range(self.depth):
             h, x, edge_attr = self._modules["EGNN_%d" % i](h, x, edges, edge_attr=edge_attr, lig_mask=lig_mask)
-        return h, x
+        return h
 
 
 #----------------------------------------------------------------------------
 # Main score network
 
-class EGNN_Net(nn.Module):
+class Force_Net(nn.Module):
     """EGNN backbone for translation and rotation scores"""
     def __init__(
         self, 
@@ -304,7 +264,6 @@ class EGNN_Net(nn.Module):
         dropout = conf.dropout
         normalize = conf.normalize
         
-        self.agg = conf.agg
         self.cut_off = conf.cut_off
         
         # single init embedding
@@ -329,22 +288,6 @@ class EGNN_Net(nn.Module):
 
         # energy head
         self.to_energy = nn.Sequential(
-            nn.Linear(2*node_dim + 1, node_dim, bias=False),
-            nn.LayerNorm(node_dim),
-            nn.SiLU(),
-            nn.Linear(node_dim, 1, bias=False),
-        )
-
-        # contact head
-        self.to_contact = nn.Sequential(
-            nn.Linear(2*node_dim + 1, node_dim, bias=False),
-            nn.LayerNorm(node_dim),
-            nn.SiLU(),
-            nn.Linear(node_dim, 1, bias=False),
-        )
-
-        # confidence head
-        self.to_confidence = nn.Sequential(
             nn.Linear(2*node_dim + 1, node_dim, bias=False),
             nn.LayerNorm(node_dim),
             nn.SiLU(),
@@ -404,71 +347,72 @@ class EGNN_Net(nn.Module):
         lig_x = batch["lig_x"] 
         rec_pos = batch["rec_pos"] 
         lig_pos = batch["lig_pos"] 
-        position_matrix = batch["position_matrix"]
         t = batch["t"]
+        position_matrix = batch["position_matrix"]
+
+        # get the current complex pose
+        pos = torch.cat([rec_pos, lig_pos], dim=0)
+
+        # get rotat and trans
+        lig_rotat = get_rotat(lig_pos).requires_grad_()
+        lig_trans = get_trans(lig_pos).requires_grad_()
+        rec_rotat = get_rotat(rec_pos)
+        rec_trans = get_trans(rec_pos)
+
+        trans = torch.cat([rec_trans, lig_trans], dim=0)
+        rotat = torch.cat([rec_rotat, lig_rotat], dim=0)
 
         # get ca distance matrix 
-        vec = rec_pos[:, None, 1, :] - lig_pos[None, :, 1, :] 
-        D = torch.norm(vec, dim=-1)
-        
-        # get current complex pose
-        lig_pos.requires_grad_()
-        pos = torch.cat([rec_pos, lig_pos], dim=0)
+        D = torch.norm((rec_pos[:, None, 1, :] - lig_pos[None, :, 1, :]), dim=-1)
 
         # node feature embedding
         x = torch.cat([rec_x, lig_x], dim=0)
         node = self.single_embed(x) # [n, c]
 
         # edge feature embedding
-        spatial_matrix = get_spatial_matrix(pos)
-        edge = self.spatial_embed(spatial_matrix) + self.positional_embed(position_matrix)
+        spatial_matrix = get_pairs(trans, rotat)
+        edge = self.spatial_embed(spatial_matrix)
+        edge = edge + self.positional_embed(position_matrix)
 
         # sample edge_index and get edge_attr
         edge_index, edge_attr = get_knn_and_sample_graph(pos[..., 1, :], edge)
 
         # main network 
-        node_out, pos_out = self.network(node, pos[..., 1, :], edge_index, edge_attr) # [R+L, H]
+        node = self.network(node, pos[..., 1, :], edge_index, edge_attr) # [R+L, H]
+        
+        # interface residue
+        ires = self.to_ires(node)
 
         # energy
-        h_rec = repeat(node_out[:rec_pos.size(0)], 'n h -> n m h', m=lig_pos.size(0))
-        h_lig = repeat(node_out[rec_pos.size(0):], 'm h -> n m h', n=rec_pos.size(0))
-        interaction = torch.cat([h_rec, h_lig, D.unsqueeze(-1)], dim=-1)
-        energy = self.to_energy(interaction).squeeze(-1) # [R, L]
+        h_rec = repeat(node[:rec_pos.size(0)], 'n h -> n m h', m=lig_pos.size(0))
+        h_lig = repeat(node[rec_pos.size(0):], 'm h -> n m h', n=rec_pos.size(0))
+        energy = self.to_energy(torch.cat([h_rec, h_lig, D.unsqueeze(-1)], dim=-1)).squeeze(-1) # [R, L]
         mask_2D = (D < self.cut_off).float() # [R, L]
-
-        if self.agg == 'mean':
-            energy = (energy * mask_2D).sum() / mask_2D.sum().clamp(min=1)
-        else:
-            energy = (energy * mask_2D).sum() 
+        energy = (energy * mask_2D).sum() / (mask_2D.sum() + 1e-6) 
 
         if return_energy:
             return energy
+        
+        dEdT, dEdR = torch.autograd.grad(
+            outputs=energy, 
+            inputs=(lig_trans, lig_rotat), 
+            grad_outputs=torch.ones_like(energy),
+            create_graph=self.training, 
+            retain_graph=self.training,
+            only_inputs=True, 
+            allow_unused=True,
+        )
 
-        # confidence head
-        confidence_logits = self.to_confidence(interaction).mean()
-
-        # contact head
-        contact_logits = self.to_contact(interaction)
-
-        # interface residue head
-        ires_logits = self.to_ires(node)
-
-        # force
-        lig_pos_curr = pos_out[rec_pos.size(0):] 
-        r = lig_pos[..., 1, :].detach()
-        f = lig_pos_curr - r # f / kT
+        # translation and rotation forces per node
+        f_tr = -dEdT
+        f_rot = skew_matrix_to_vector(dEdR)
 
         # translation
-        if self.agg == 'mean':
-            tr_pred = f.mean(dim=0, keepdim=True)
-        else:
-            tr_pred = f.sum(dim=0, keepdim=True)
+        tr_pred = f_tr.sum(dim=0, keepdim=True)
 
         # rotation
-        if self.agg == 'mean':
-            rot_pred = torch.cross(r, f, dim=-1).mean(dim=0, keepdim=True)
-        else:
-            rot_pred = torch.cross(r, f, dim=-1).sum(dim=0, keepdim=True)
+        r = lig_pos[..., 1, :].detach()
+        rot_pred = f_rot.sum(dim=0, keepdim=True) + torch.cross(r, f_tr, dim=-1).sum(dim=0, keepdim=True)
 
         # scale
         t = self.t_embed(t)
@@ -484,37 +428,17 @@ class EGNN_Net(nn.Module):
                 "tr_score": tr_score,
                 "rot_score": rot_score,
                 "energy": energy,
-                "f": f,
                 "num_clashes": num_clashes,
-                "contact_logits": contact_logits,
-                "ires_logits": ires_logits,
-                "confidence_logits": confidence_logits,
+                "ires": ires,
             }
 
             return outputs
 
-        # dedx
-        dedx = torch.autograd.grad(
-            outputs=energy, 
-            inputs=lig_pos, 
-            grad_outputs=torch.ones_like(energy),
-            create_graph=self.training, 
-            retain_graph=self.training,
-            only_inputs=True, 
-            allow_unused=True,
-        )[0]
-
-        dedx = -dedx[..., 1, :] # F / kT
-        
         outputs = {
             "tr_score": tr_score,
             "rot_score": rot_score,
             "energy": energy,
-            "f": f,
-            "dedx": dedx,
-            "contact_logits": contact_logits,
-            "ires_logits": ires_logits,
-            "confidence_logits": confidence_logits,
+            "ires": ires,
         }
 
         return outputs
@@ -525,30 +449,33 @@ class EGNN_Net(nn.Module):
 if __name__ == '__main__':
     conf = ModelConfig(
         lm_embed_dim=1280,
-        positional_embed_dim=66,
-        spatial_embed_dim=100,
+        positional_embed_dim=68,
+        spatial_embed_dim=25,
+        contact_embed_dim=1,
         node_dim=24,
-        edge_dim=12,
+        edge_dim=24,
         inner_dim=24,
         depth=2,
     )
 
-    model = EGNN_Net(conf)
+    model = Force_Net(conf)
 
     rec_x = torch.randn(40, 1280)
     lig_x = torch.randn(5, 1280)
     rec_pos = torch.randn(40, 3, 3)
     lig_pos = torch.randn(5, 3, 3)
-    position_matrix = torch.randn(45, 45, 66)
     t = torch.tensor([0.5])
+    contact_matrix = torch.zeros(45, 45)
+    position_matrix = torch.zeros(45, 45, 68)
 
     batch = {
         "rec_x": rec_x,
         "lig_x": lig_x,
         "rec_pos": rec_pos,
         "lig_pos": lig_pos,
-        "position_matrix": position_matrix,
         "t": t,
+        "contact_matrix": contact_matrix,
+        "position_matrix": position_matrix,
     }
 
     out = model(batch)

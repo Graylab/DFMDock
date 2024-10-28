@@ -17,7 +17,7 @@ from utils.geometry import axis_angle_to_matrix, matrix_to_axis_angle
 from utils.residue_constants import restype_3to1, sequence_to_onehot, restype_order_with_x
 from utils.pdb import save_PDB, place_fourth_atom 
 from utils.metrics import compute_metrics
-from models.DFMDock import DFMDock
+from models.DFMDock_1 import DFMDock
 
 
 #----------------------------------------------------------------------------
@@ -420,8 +420,7 @@ def Euler_Maruyama_sampler(
                 batch["lig_pos"] = lig_pos.clone().detach()
                 output = model(batch) 
 
-    return rec_pos, lig_pos, rot_update, tr_update, output["energy"], output["num_clashes"], output["tm_logits"]
-
+    return rec_pos, lig_pos, rot_update, tr_update, output
 
 #----------------------------------------------------------------------------
 # run function
@@ -429,7 +428,7 @@ def Euler_Maruyama_sampler(
 def run(args, model, inputs, batch, device):
     metrics_list = []
     for i in range(args.num_samples):
-        rec_pos, lig_pos, rot_update, tr_update, energy, num_clashes, tm_logits = Euler_Maruyama_sampler(
+        rec_pos, lig_pos, rot_update, tr_update, output = Euler_Maruyama_sampler(
             model=model, 
             batch=batch, 
             num_steps=args.num_steps,
@@ -447,9 +446,9 @@ def run(args, model, inputs, batch, device):
         pred = (rec_pos.detach().cpu(), lig_pos.detach().cpu())
         native = (torch.from_numpy(inputs['receptor']['bb_coords']).float(), torch.from_numpy(inputs['ligand']['bb_coords']).float())
         metrics.update(compute_metrics(pred, native))
-        metrics.update({'energy': energy.item()})
-        metrics.update({'num_clashes': num_clashes.item()})
-        metrics.update({'iptm': compute_tm(tm_logits).item()})
+        metrics.update({'energy': output['energy'].item()})
+        metrics.update({'confidence_logits': output['confidence_logits'].item()})
+        metrics.update({'num_clashes': output['num_clashes'].item()})
         metrics_list.append(metrics)
 
         # get aa structure

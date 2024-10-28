@@ -1,0 +1,9 @@
+_target_: datasets.ppi_mlsb_dataset.PPIDataModule
+
+train_dataset: dips_train_hetero
+val_dataset: dips_val_hetero
+use_esm: True
+crop_size: 1500
+batch_size: 1
+num_workers: 12
+pin_memory: True
