@@ -27,21 +27,6 @@ To install the project in editable mode, run the following command:
 pip install -e .
 ```
 
-### Reproducing Results
-
-To reproduce the results from the paper, follow these steps:
-
-1. Navigate to the `scripts` directory:
-    ```bash
-    cd scripts
-    ```
-
-2. Run the inference script by executing the following command:
-    ```bash
-    bash inference.sh
-    ```
-
-This will initiate the process to reproduce the results as described in the paper.
 
 ### Usage
 
