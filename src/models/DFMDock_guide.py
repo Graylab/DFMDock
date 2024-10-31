@@ -16,6 +16,7 @@ from utils.so3_diffuser import SO3Diffuser
 from utils.r3_diffuser import R3Diffuser 
 from utils.geometry import axis_angle_to_matrix
 from utils.crop import get_crop_idxs, get_crop, get_position_matrix
+from utils.loss import distogram_loss
 
 #----------------------------------------------------------------------------
 # Main wrapper for training the model
@@ -38,8 +39,8 @@ class DFMDock(pl.LightningModule):
         # confidence model
         self.use_confidence_loss = experiment.use_confidence_loss
 
-        # contact model
-        self.use_contact_loss = experiment.use_contact_loss
+        # dist model
+        self.use_dist_loss = experiment.use_dist_loss
 
         # interface residue model
         self.use_interface_loss = experiment.use_interface_loss
@@ -109,7 +110,7 @@ class DFMDock(pl.LightningModule):
             # get crop_idxs
             crop_idxs = get_crop_idxs(batch_gt, crop_size=self.crop_size)
             
-            # crop
+            # pre crop
             batch = get_crop(batch, crop_idxs)
             batch_gt = get_crop(batch_gt, crop_idxs)
 
@@ -123,6 +124,10 @@ class DFMDock(pl.LightningModule):
             self.move_to_lig_center(batch)
             self.move_to_lig_center(batch_gt)
 
+            # post crop
+            #batch = get_crop(batch, crop_idxs)
+            #batch_gt = get_crop(batch_gt, crop_idxs)
+
             # get gt contact
             gt_dist = torch.norm((batch_gt["rec_pos"][:, None, 1, :] - batch_gt["lig_pos"][None, :, 1, :]), dim=-1, keepdim=True)
             gt_contact = torch.where(gt_dist < 8.0, 1.0, 0.0)
@@ -133,6 +138,7 @@ class DFMDock(pl.LightningModule):
                 contact_matrix = torch.zeros((n, n), device=self.device).unsqueeze(-1)
                 
             batch["position_matrix"] = torch.cat([batch["position_matrix"], contact_matrix], dim=-1)
+            batch_gt["position_matrix"] = torch.cat([batch_gt["position_matrix"], contact_matrix], dim=-1)
 
             # get gt interface
             gt_ires = get_interface_residue_tensors(batch_gt["rec_pos"][:, 1, :], batch_gt["lig_pos"][:, 1, :])
@@ -143,6 +149,8 @@ class DFMDock(pl.LightningModule):
 
             batch["rec_x"] = torch.cat([batch["rec_x"], ires[:gt_contact.size(0)]], dim=-1)
             batch["lig_x"] = torch.cat([batch["lig_x"], ires[gt_contact.size(0):]], dim=-1)
+            batch_gt["rec_x"] = torch.cat([batch_gt["rec_x"], ires[:gt_contact.size(0)]], dim=-1)
+            batch_gt["lig_x"] = torch.cat([batch_gt["lig_x"], ires[gt_contact.size(0):]], dim=-1)
         
         # predict score based on the current state
         if self.grad_energy:
@@ -228,14 +236,16 @@ class DFMDock(pl.LightningModule):
             el_loss = torch.tensor(0.0, device=self.device)
 
         bce_logits_loss = nn.BCEWithLogitsLoss()
-        # contact loss
-        if self.use_contact_loss:
-            contact_loss = bce_logits_loss(outputs["contact_logits"], gt_contact)
+        # distogram loss
+        if self.use_dist_loss:
+            gt_dist = torch.norm((batch_gt["rec_pos"][:, None, 1, :] - batch_gt["lig_pos"][None, :, 1, :]), dim=-1, keepdim=True)
+            dist_loss = distogram_loss(outputs["dist_logits"], gt_dist)
         else:
-            contact_loss = torch.tensor(0.0, device=self.device)
+            dist_loss = torch.tensor(0.0, device=self.device)
 
         # interface loss
         if self.use_interface_loss:
+            gt_ires = get_interface_residue_tensors(batch_gt["rec_pos"][:, 1, :], batch_gt["lig_pos"][:, 1, :])
             ires_loss = bce_logits_loss(outputs["ires_logits"], gt_ires)
         else:
             ires_loss = torch.tensor(0.0, device=self.device)
@@ -248,13 +258,13 @@ class DFMDock(pl.LightningModule):
             conf_loss = torch.tensor(0.0, device=self.device)
 
         # total losses
-        loss = tr_loss + rot_loss + ec_loss + el_loss + contact_loss + ires_loss + conf_loss
+        loss = tr_loss + rot_loss + 0.1 * (ec_loss + el_loss+ conf_loss + dist_loss + ires_loss)
         losses = {
             "tr_loss": tr_loss, 
             "rot_loss": rot_loss, 
             "ec_loss": ec_loss, 
             "el_loss": el_loss, 
-            "contact_loss": contact_loss, 
+            "dist_loss": dist_loss, 
             "ires_loss": ires_loss,
             "conf_loss": conf_loss,
             "loss": loss,
@@ -280,6 +290,7 @@ class DFMDock(pl.LightningModule):
         lig_x = batch['lig_x'].squeeze(0)
         rec_pos = batch['rec_pos'].squeeze(0)
         lig_pos = batch['lig_pos'].squeeze(0)
+        is_homomer = batch['is_homomer']
 
         # wrap to a batch
         batch = {
@@ -287,6 +298,7 @@ class DFMDock(pl.LightningModule):
             "lig_x": lig_x,
             "rec_pos": rec_pos,
             "lig_pos": lig_pos,
+            "is_homomer": is_homomer,
         }
 
         # get losses
@@ -338,6 +350,7 @@ class DFMDock(pl.LightningModule):
             weight_decay=self.weight_decay
         )
         return optimizer
+
 
 #----------------------------------------------------------------------------
 # helper functions
@@ -424,22 +437,23 @@ def get_contact_matrix(contact_pairs, num_samples=None):
     
     return contact_matrix
     
+
 #----------------------------------------------------------------------------
 # Testing run
 
 @hydra.main(version_base=None, config_path="/scratch4/jgray21/lchu11/graylab_repos/DFMDock/configs/model", config_name="DFMDock_guide.yaml")
 def main(conf: DictConfig):
-    #dataset = PinderDataset(
-    #    data_dir='/scratch4/jgray21/lchu11/data/pinder/train',
-    #    training=True,
-    #    use_esm=True,
-    #)
-    
-    dataset = DockingDataset(
-        dataset='dips_train',
+    dataset = PinderDataset(
+        data_dir='/scratch4/jgray21/lchu11/data/pinder/train',
         training=True,
         use_esm=True,
     )
+    
+    #dataset = DockingDataset(
+    #    dataset='dips_train',
+    #    training=True,
+    #    use_esm=True,
+    #)
 
     subset_indices = [0]
     subset = data.Subset(dataset, subset_indices)

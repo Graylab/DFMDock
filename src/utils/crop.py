@@ -6,7 +6,7 @@ def one_hot(x, v_bins):
     am = torch.argmin(torch.abs(diffs), dim=-1)
     return torch.nn.functional.one_hot(am, num_classes=len(v_bins)).float()
 
-def relpos(res_id, asym_id, use_chain_relative=True):
+def relpos(res_id, asym_id, entity_id, use_chain_relative=True):
     max_relative_idx = 32
     pos = res_id
     asym_id_same = (asym_id[..., None] == asym_id[..., None, :])
@@ -34,6 +34,9 @@ def relpos(res_id, asym_id, use_chain_relative=True):
         )
 
         rel_feats.append(rel_pos)
+
+        entity_id_same = (entity_id[..., None] == entity_id[..., None, :])
+        rel_feats.append(entity_id_same[..., None].to(dtype=rel_pos.dtype))
 
     else:
         boundaries = torch.arange(
@@ -133,41 +136,6 @@ def randint(lower, upper):
         (1,),
     )[0])
 
-def crop_to_size(rec_x, lig_x, rec_pos, lig_pos, crop_size):
-    n = rec_x.size(0) + lig_x.size(0)
-    x = torch.cat([rec_x, lig_x], dim=0)
-    pos = torch.cat([rec_pos, lig_pos], dim=0)
-    res_id = torch.arange(n, device=x.device).long()
-    asym_id = torch.zeros(n, device=x.device).long()
-    asym_id[rec_x.size(0):] = 1
-
-    use_spatial_crop = True
-    num_res = asym_id.size(0)
-
-    if num_res <= crop_size:
-        crop_idxs = torch.arange(num_res)
-    elif use_spatial_crop:
-        crop_idxs = get_spatial_crop_idx(pos, asym_id, crop_size=crop_size)
-    else:
-        crop_idxs = get_contiguous_crop_idx(asym_id, crop_size=crop_size)
-
-    crop_idxs = crop_idxs.to(x.device)
-    res_id = torch.index_select(res_id, 0, crop_idxs)
-    asym_id = torch.index_select(asym_id, 0, crop_idxs)
-    x = torch.index_select(x, 0, crop_idxs)
-    pos = torch.index_select(pos, 0, crop_idxs)
-
-    sep = asym_id.tolist().index(1)
-    rec_x = x[:sep]
-    lig_x = x[sep:]
-    rec_pos = pos[:sep]
-    lig_pos = pos[sep:]
-
-    # Positional embeddings
-    position_matrix = relpos(res_id, asym_id).to(x.device)
-
-    return rec_x, lig_x, rec_pos, lig_pos, position_matrix
-
 def get_crop_idxs(batch, crop_size):
     rec_pos = batch["rec_pos"]
     lig_pos = batch["lig_pos"]
@@ -195,6 +163,7 @@ def get_crop(batch, crop_idxs):
     lig_x = batch["lig_x"]
     rec_pos = batch["rec_pos"]
     lig_pos = batch["lig_pos"]
+    is_homomer = batch["is_homomer"]
 
     n = rec_x.size(0) + lig_x.size(0)
     x = torch.cat([rec_x, lig_x], dim=0)
@@ -203,8 +172,13 @@ def get_crop(batch, crop_idxs):
     asym_id = torch.zeros(n, device=x.device).long()
     asym_id[rec_x.size(0):] = 1
 
+    entity_id = torch.zeros(n, device=x.device).long()
+    if not is_homomer:
+        entity_id[rec_x.size(0):] = 1
+
     res_id = torch.index_select(res_id, 0, crop_idxs)
     asym_id = torch.index_select(asym_id, 0, crop_idxs)
+    entity_id = torch.index_select(entity_id, 0, crop_idxs)
     x = torch.index_select(x, 0, crop_idxs)
     pos = torch.index_select(pos, 0, crop_idxs)
 
@@ -215,7 +189,7 @@ def get_crop(batch, crop_idxs):
     lig_pos = pos[sep:]
 
     # Positional embeddings
-    position_matrix = relpos(res_id, asym_id).to(x.device)
+    position_matrix = relpos(res_id, asym_id, entity_id).to(x.device)
 
     batch["rec_x"] = rec_x
     batch["lig_x"] = lig_x
@@ -225,18 +199,22 @@ def get_crop(batch, crop_idxs):
 
     return batch
 
-
 def get_position_matrix(batch):
     rec_x = batch["rec_x"]
     lig_x = batch["lig_x"]
+    is_homomer = batch["is_homomer"]
     x = torch.cat([rec_x, lig_x], dim=0)
     
     res_id = torch.arange(x.size(0), device=x.device).long()
     asym_id = torch.zeros(x.size(0), device=x.device).long()
     asym_id[rec_x.size(0):] = 1
 
+    entity_id = torch.zeros(x.size(0), device=x.device).long()
+    if not is_homomer:
+        entity_id[rec_x.size(0):] = 1
+
     # Positional embeddings
-    position_matrix = relpos(res_id, asym_id).to(x.device)
+    position_matrix = relpos(res_id, asym_id, entity_id).to(x.device)
 
     batch["position_matrix"] = position_matrix
 

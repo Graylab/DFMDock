@@ -166,9 +166,11 @@ outputs/
 scripts/
 checkpoints/
 lightning_logs/
+tests/
 *.pdb
 *.csv
 *.ipynb
 *.png
+*.yaml
 inference_gpu.sh
 submit_inference.sh

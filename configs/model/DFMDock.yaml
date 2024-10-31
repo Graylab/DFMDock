@@ -2,7 +2,7 @@ _target_: models.DFMDock.DFMDock
 
 model:
   lm_embed_dim: 1301 # 1280 (ESM) + 21 (One-Hot) 
-  positional_embed_dim: 66 # 66 (Residue)
+  positional_embed_dim: 67 # 66 (relpos) + 1 (sym)
   spatial_embed_dim: 100 # 40 (dist) + 24 (phi) + 24 (psi) + 12 (omega) 
   node_dim: 256
   edge_dim: 128
@@ -38,7 +38,7 @@ experiment:
   separate_rot_loss: True
   grad_energy: False
   use_contrastive_loss: False
-  use_contact_loss: False
-  use_interface_loss: False
   use_confidence_loss: False
+  use_dist_loss: False
+  use_interface_loss: False
 

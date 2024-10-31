@@ -7,40 +7,32 @@ import esm
 import torch
 import torch.nn.functional as F
 import numpy as np
+import random
 import argparse
 import biotite.structure as struc
 import biotite.structure.io as strucio
+from pathlib import Path
 from biotite.structure.io.pdb import PDBFile
 from tqdm import tqdm
 from scipy.spatial.transform import Rotation 
 from utils.geometry import axis_angle_to_matrix, matrix_to_axis_angle
 from utils.residue_constants import restype_3to1, sequence_to_onehot, restype_order_with_x
-from utils.pdb import save_PDB, place_fourth_atom 
 from utils.metrics import compute_metrics
-from models.DFMDock_1 import DFMDock
+from models.DFMDock import DFMDock
 
+
+def set_seed(seed=42):
+    # Set seed for Python's random library
+    random.seed(seed)
+    
+    # Set seed for NumPy
+    np.random.seed(seed)
+    
+    # Set seed for PyTorch
+    torch.manual_seed(seed)
 
 #----------------------------------------------------------------------------
 # output functions
-
-def save_pdb(output, out_pdb):
-    if os.path.exists(out_pdb):
-        os.remove(out_pdb)
-        
-    seq1 = output["rec_seq"]
-    seq2 = output["lig_seq"]
-        
-    coords = torch.cat([output["rec_pos"], output["lig_pos"]], dim=0)
-    coords = get_full_coords(coords)
-
-    # get total len
-    total_len = coords.size(0)
-
-    # check seq len
-    assert len(seq1) + len(seq2) == total_len
-
-    # get pdb
-    save_PDB(out_pdb=out_pdb, coords=coords, seq=seq1+seq2, delim=len(seq1)-1)
 
 def combine_atom_arrays(atom_array_1, atom_array_2):
     """
@@ -76,54 +68,6 @@ def combine_atom_arrays(atom_array_1, atom_array_2):
 
 #----------------------------------------------------------------------------
 # pre-process functions
-
-def one_hot(x, v_bins):
-    reshaped_bins = v_bins.view(((1,) * len(x.shape)) + (len(v_bins),))
-    diffs = x[..., None] - reshaped_bins
-    am = torch.argmin(torch.abs(diffs), dim=-1)
-    return F.one_hot(am, num_classes=len(v_bins)).float()
-
-def relpos(res_id, asym_id, use_chain_relative=True):
-    max_relative_idx = 32
-    pos = res_id
-    asym_id_same = (asym_id[..., None] == asym_id[..., None, :])
-    offset = pos[..., None] - pos[..., None, :]
-
-    clipped_offset = torch.clamp(
-        offset + max_relative_idx, 0, 2 * max_relative_idx
-    )
-
-    rel_feats = []
-    if use_chain_relative:
-        final_offset = torch.where(
-            asym_id_same, 
-            clipped_offset,
-            (2 * max_relative_idx + 1) * 
-            torch.ones_like(clipped_offset)
-        )
-
-        boundaries = torch.arange(
-            start=0, end=2 * max_relative_idx + 2
-        )
-        rel_pos = one_hot(
-            final_offset,
-            boundaries,
-        )
-
-        rel_feats.append(rel_pos)
-
-    else:
-        boundaries = torch.arange(
-            start=0, end=2 * max_relative_idx + 1
-        )
-        rel_pos = one_hot(
-            clipped_offset, boundaries,
-        )
-        rel_feats.append(rel_pos)
-
-    rel_feat = torch.cat(rel_feats, dim=-1).float()
-
-    return rel_feat
 
 def get_info_from_pdb(pdb_path):
     # Load the structure from the PDB file
@@ -184,11 +128,15 @@ def get_batch_from_inputs(inputs, batch_converter, esm_model, device):
     rec_pos = torch.from_numpy(inputs['receptor']['bb_coords']).float().to(device)
     lig_pos = torch.from_numpy(inputs['ligand']['bb_coords']).float().to(device)
 
+    # is homomer
+    is_homomer = inputs['receptor']['seq'] == inputs['ligand']['seq'] 
+
     batch = {
         'rec_x': rec_x,
         'lig_x': lig_x,
         'rec_pos': rec_pos,
         'lig_pos': lig_pos,
+        'is_homomer': is_homomer,
     }
 
     return batch
@@ -297,25 +245,6 @@ def modify_aa_coords(x, rot, tr):
     x = x + tr.cpu().numpy()
     
     return x
-
-def get_full_coords(coords):
-    #get full coords
-    N, CA, C = [x.squeeze(-2) for x in coords.chunk(3, dim=-2)]
-    # Infer CB coordinates.
-    b = CA - N
-    c = C - CA
-    a = b.cross(c, dim=-1)
-    CB = -0.58273431 * a + 0.56802827 * b - 0.54067466 * c + CA
-    
-    O = place_fourth_atom(torch.roll(N, -1, 0),
-                                    CA, C,
-                                    torch.tensor(1.231),
-                                    torch.tensor(2.108),
-                                    torch.tensor(-3.142))
-    full_coords = torch.stack(
-        [N, CA, C, O, CB], dim=1)
-    
-    return full_coords
 
 def get_clash_force(rec_pos, lig_pos):
     rec_pos = rec_pos.view(-1, 3)
@@ -524,7 +453,7 @@ def main(args):
         batch = get_batch_from_inputs(inputs, batch_converter, esm_model, device)
 
         # Move the batch to the same device as the model
-        batch = {k: v.to(device) for k, v in batch.items()}
+        batch = {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
 
         # run
         metrics_list = run(args, model, inputs, batch, device)
@@ -547,6 +476,66 @@ def main(args):
         for row in results:
             writer.writerow(row)
 
+#----------------------------------------------------------------------------
+# inference function for a single target
+
+def inference(in_pdb_1, in_pdb_2):
+    # set device
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    # load esm model
+    esm_model, alphabet = esm.pretrained.esm2_t33_650M_UR50D()
+    batch_converter = alphabet.get_batch_converter()
+    esm_model = esm_model.to(device).eval()
+    
+    # load score model
+    model = DFMDock.load_from_checkpoint(
+        str(Path("../weights/pinder_0.ckpt")), 
+        map_location=device,
+    )
+
+    model.to(device).eval()
+
+    # load pdbs
+    receptor = get_info_from_pdb(in_pdb_1)
+    ligand = get_info_from_pdb(in_pdb_2)
+
+    # prepare inputs 
+    inputs = {
+        "receptor": receptor,
+        "ligand": ligand,
+    }
+
+    batch = get_batch_from_inputs(inputs, batch_converter, esm_model, device)
+
+    # Move the batch to the same device as the model
+    batch = {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
+
+    # define 
+    num_samples=1
+    num_steps=40
+    use_clash_force=True
+
+    # run 
+    for i in range(num_samples):
+        rec_pos, lig_pos, rot_update, tr_update, outputs = Euler_Maruyama_sampler(
+            model=model, 
+            batch=batch, 
+            num_steps=num_steps,
+            device=device,
+            use_clash_force=use_clash_force,
+        )
+        
+    lig_aa_coords = modify_aa_coords(ligand["aa_coords"], rot_update, tr_update)
+    rec_structure = receptor["structure"]
+    lig_structure = ligand["structure"]
+    lig_structure.coord = lig_aa_coords
+
+    complex_structure = combine_atom_arrays(rec_structure, lig_structure)
+
+    file = PDBFile()
+    file.set_structure(complex_structure)
+    file.write("output.pdb")
 
 if __name__ == "__main__":
     # Initialize the parser
@@ -566,9 +555,13 @@ if __name__ == "__main__":
     parser.add_argument("--rot_noise_scale", type=int, help="Rotation noise scale", default=0.5) 
     parser.add_argument("--use_clash_force", action='store_true', help="Use clash force") 
     parser.add_argument("--noise_annealing", action='store_true', help="Use clash force") 
+    parser.add_argument("--seed", type=int, help="Random seed", default=42) 
 
     # Parse the arguments
     args = parser.parse_args()
+
+    # Set random seeds
+    set_seed(args.seed)
 
     # Call the main function with parsed arguments
     main(args)

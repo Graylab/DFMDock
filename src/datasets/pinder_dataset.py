@@ -98,6 +98,9 @@ class PinderDataset(Dataset):
         # random rotation augmentation
         rec_pos, lig_pos = random_rotation(rec_pos, lig_pos)
 
+        # is homomer
+        is_homomer = rec_seq == lig_seq
+
         # Output
         output = {
             'id': _id,
@@ -107,6 +110,7 @@ class PinderDataset(Dataset):
             'lig_x': lig_x,
             'rec_pos': rec_pos,
             'lig_pos': lig_pos,
+            'is_homomer': is_homomer,
         }
         
         return {key: value for key, value in output.items()}

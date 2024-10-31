@@ -5,16 +5,10 @@ import random
 import torch
 import torch.nn.functional as F
 import pytorch_lightning as pl
-import warnings
-from tqdm import tqdm
-from pathlib import Path
-from tqdm import tqdm
 from typing import Optional
 from torch.utils.data import DataLoader, Dataset
-from torch_geometric.data import HeteroData
 from scipy.spatial.transform import Rotation 
 from utils import residue_constants
-from utils.crop import get_crop_idxs, get_crop
 
 #----------------------------------------------------------------------------
 # Helper functions
@@ -52,19 +46,10 @@ class DockingDataset(Dataset):
         dataset: str,
         training: bool = True,
         use_esm: bool = True,
-        use_attn: bool = False,
     ):
         self.dataset = dataset 
         self.training = training
         self.use_esm = use_esm
-        self.use_attn = use_attn
-
-        if self.use_attn:
-            # Load esm
-            self.esm_model, alphabet = esm.pretrained.load_model_and_alphabet('/home/lchu11/.cache/torch/hub/checkpoints/esm2_t33_650M_UR50D.pt')
-            self.batch_converter = alphabet.get_batch_converter()
-            self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-            self.esm_model = self.esm_model.to(self.device).eval()
 
         if dataset == 'dips_train':
             self.data_dir = "/scratch4/jgray21/lchu11/data/dips/pt_clean"
@@ -129,57 +114,31 @@ class DockingDataset(Dataset):
             rec_x = rec_onehot
             lig_x = lig_onehot
 
-        if self.use_attn:
-            seq = rec_seq + lig_seq
-            attn = get_esm_attn(seq, self.batch_converter, self.esm_model, self.device)
-
         # Shuffle and Crop for training
         if self.training:
             # Shuffle the order of rec and lig
             vars_list = [(rec_x, rec_seq, rec_pos), (lig_x, lig_seq, lig_pos)]
-
             if random.random() > 0.5:
-                if self.use_attn:
-                    n = rec_x.size(0)
-                    attn_upper_left = attn[:n, :n]
-                    attn_upper_right = attn[:n, n:]
-                    attn_lower_left = attn[n:, :n]
-                    attn_lower_right = attn[n:, n:]
-                    attn_upper = torch.cat([attn_lower_right, attn_lower_left], dim=1)
-                    attn_lower = torch.cat([attn_upper_right, attn_upper_left], dim=1)
-                    attn = torch.cat([attn_upper, attn_lower], dim=0)
-
                 rec_x, rec_seq, rec_pos = vars_list[1]
                 lig_x, lig_seq, lig_pos = vars_list[0]
 
         # Random rotation augmentation
         rec_pos, lig_pos = random_rotation(rec_pos, lig_pos)
 
-        if self.use_attn:
-            # Output
-            output = {
-                'id': _id,
-                'rec_seq': rec_seq,
-                'lig_seq': lig_seq,
-                'rec_x': rec_x,
-                'lig_x': lig_x,
-                'rec_pos': rec_pos,
-                'lig_pos': lig_pos,
-                'attn': attn,
-            }
+        # is homomer
+        is_homomer = rec_seq == lig_seq
 
-        else:
-            # Output
-            output = {
-                'id': _id,
-                'rec_seq': rec_seq,
-                'lig_seq': lig_seq,
-                'rec_x': rec_x,
-                'lig_x': lig_x,
-                'rec_pos': rec_pos,
-                'lig_pos': lig_pos,
-            }
-
+        # Output
+        output = {
+            'id': _id,
+            'rec_seq': rec_seq,
+            'lig_seq': lig_seq,
+            'rec_x': rec_x,
+            'lig_x': lig_x,
+            'rec_pos': rec_pos,
+            'lig_pos': lig_pos,
+            'is_homomer': is_homomer,
+        }
         
         return {key: value for key, value in output.items()}
 
@@ -197,7 +156,6 @@ class DockingDataModule(pl.LightningDataModule):
         val_set: str = 'dips_val',
         batch_size: int = 1,
         use_esm: bool = True,
-        use_attn: bool = False,
         **kwargs
     ):
         super().__init__()
@@ -205,7 +163,6 @@ class DockingDataModule(pl.LightningDataModule):
         self.val_set = val_set
         self.batch_size = batch_size
         self.use_esm = use_esm
-        self.use_attn = use_attn
         self.num_workers = kwargs['num_workers']
         self.pin_memory = kwargs['pin_memory']
 
@@ -219,12 +176,10 @@ class DockingDataModule(pl.LightningDataModule):
         self.data_train = DockingDataset(
             dataset=self.train_set,
             use_esm=self.use_esm,
-            use_attn=self.use_attn,
         )
         self.data_val = DockingDataset(
             dataset=self.val_set,
             use_esm=self.use_esm,
-            use_attn=self.use_attn,
         )
 
     def train_dataloader(self):
