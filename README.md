@@ -33,7 +33,7 @@ pip install -e .
 To run inference on your own PDB files, use the following command:
 
 ```bash
-python src/inference.py path_to_input_pdb_1 path_to_input_pdb_2
+python src/inference_single.py path_to_input_pdb_1 path_to_input_pdb_2
 ```
 
 ### Citing this work
