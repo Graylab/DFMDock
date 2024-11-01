@@ -167,6 +167,7 @@ scripts/
 checkpoints/
 lightning_logs/
 tests/
+debug/
 *.pdb
 *.csv
 *.ipynb

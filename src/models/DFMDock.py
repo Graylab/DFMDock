@@ -69,9 +69,6 @@ class DFMDock(pl.LightningModule):
         # move lig center to origin
         self.move_to_lig_center(batch)
 
-        # get position matrix
-        batch = get_position_matrix(batch)
-
         # predict
         outputs = self.net(batch, predict=True)
 

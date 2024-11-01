@@ -4,6 +4,7 @@ warnings.filterwarnings("ignore", category=FutureWarning)
 import os
 import csv
 import esm
+import copy
 import torch
 import torch.nn.functional as F
 import numpy as np
@@ -19,7 +20,7 @@ from utils.geometry import axis_angle_to_matrix, matrix_to_axis_angle
 from utils.residue_constants import restype_3to1, sequence_to_onehot, restype_order_with_x
 from utils.metrics import compute_metrics
 from utils.crop import get_position_matrix
-from models.DFMDock import DFMDock
+from models.DFMDock_guide import DFMDock
 
 
 def set_seed(seed=42):
@@ -34,24 +35,6 @@ def set_seed(seed=42):
 
 #----------------------------------------------------------------------------
 # output functions
-def save_pdb(pred):
-    # set output directory
-    out_pdb =  os.path.join(self.data_conf.out_pdb_dir, pred._id + '_p' + pred.index + '.pdb')
-
-    seq1 = pred.rec_seq
-    seq2 = pred.lig_seq
-        
-    coords = torch.cat([pred.rec_pos, pred.lig_pos], dim=0)
-    coords = get_full_coords(coords)
-
-    # get total len
-    total_len = coords.size(0)
-
-    # check seq len
-    assert len(seq1) + len(seq2) == total_len
-
-    # get pdb
-    save_PDB(out_pdb=out_pdb, coords=coords, seq=seq1+seq2, delim=len(seq1)-1)
 
 def combine_atom_arrays(atom_array_1, atom_array_2):
     """
@@ -150,6 +133,7 @@ def get_batch_from_inputs(inputs, batch_converter, esm_model, device):
     # is homomer
     is_homomer = inputs['receptor']['seq'] == inputs['ligand']['seq'] 
 
+    # get batch
     batch = {
         'rec_x': rec_x,
         'lig_x': lig_x,
@@ -160,6 +144,15 @@ def get_batch_from_inputs(inputs, batch_converter, esm_model, device):
 
     # get position matrix
     batch = get_position_matrix(batch)
+    
+    # contact matrix
+    n = rec_x.size(0) + lig_x.size(0)
+    contact_matrix = torch.zeros((n, n), device=device).unsqueeze(-1)        
+    batch["position_matrix"] = torch.cat([batch["position_matrix"], contact_matrix], dim=-1)
+
+    ires = torch.zeros(n, 1, device=device)
+    batch["rec_x"] = torch.cat([batch["rec_x"], ires[:batch["rec_x"].size(0)]], dim=-1)
+    batch["lig_x"] = torch.cat([batch["lig_x"], ires[batch["rec_x"].size(0):]], dim=-1)
 
     return batch
 
@@ -359,7 +352,7 @@ def Euler_Maruyama_sampler(
 
             tr_update = tr_update + tr
             rot_update = rot_compose(rot_update, rot)
-
+            
             if use_clash_force:
                 clash_force = get_clash_force(rec_pos.detach().clone(), lig_pos.detach().clone())
                 lig_pos = lig_pos + clash_force
@@ -377,12 +370,11 @@ def Euler_Maruyama_sampler(
 
 def run(args, model, inputs, batch, device):
     metrics_list = []
-    id = inputs["id"]
-
     for i in range(args.num_samples):
+        temp_batch = batch.copy() 
         rec_pos, lig_pos, rot_update, tr_update, output = Euler_Maruyama_sampler(
             model=model, 
-            batch=batch.copy(), 
+            batch=temp_batch, 
             num_steps=args.num_steps,
             device=device,
             use_clash_force=args.use_clash_force,
@@ -391,6 +383,8 @@ def run(args, model, inputs, batch, device):
             rot_noise_scale=args.rot_noise_scale,
         )
         
+        id = inputs["id"]
+
         # get metrics
         metrics = {'id': id, 'index': str(i)}
         pred = (rec_pos.detach().cpu(), lig_pos.detach().cpu())
@@ -546,7 +540,7 @@ def inference(in_pdb_1, in_pdb_2):
     for i in range(num_samples):
         rec_pos, lig_pos, rot_update, tr_update, outputs = Euler_Maruyama_sampler(
             model=model, 
-            batch=batch.copy(), 
+            batch=batch, 
             num_steps=num_steps,
             device=device,
             use_clash_force=use_clash_force,
