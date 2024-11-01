@@ -8,7 +8,6 @@ import numpy as np
 from torch.utils import data
 from torch_geometric.loader import DataLoader
 from omegaconf import DictConfig
-from datasets.pinder_dataset import PinderDataset
 from datasets.docking_dataset import DockingDataset
 from models.egnn_net import EGNN_Net
 from utils.so3_diffuser import SO3Diffuser 
@@ -358,17 +357,11 @@ def get_rmsd(pred, label):
 
 @hydra.main(version_base=None, config_path="/scratch4/jgray21/lchu11/graylab_repos/DFMDock/configs/model", config_name="DFMDock.yaml")
 def main(conf: DictConfig):
-    dataset = PinderDataset(
-        data_dir='/scratch4/jgray21/lchu11/data/pinder/train',
+    dataset = DockingDataset(
+        dataset='dips_train',
         training=True,
         use_esm=True,
     )
-    
-    #dataset = DockingDataset(
-    #    dataset='dips_train',
-    #    training=True,
-    #    use_esm=True,
-    #)
 
     subset_indices = [0]
     subset = data.Subset(dataset, subset_indices)
