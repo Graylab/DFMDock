@@ -490,7 +490,7 @@ def inference(in_pdb_1, in_pdb_2):
     
     # load score model
     model = DFMDock.load_from_checkpoint(
-        str(Path("../weights/pinder_0.ckpt")), 
+        str(Path("./DFMDock/weights/pinder_0.ckpt")), 
         map_location=device,
     )
 
