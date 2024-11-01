@@ -490,7 +490,7 @@ def inference(in_pdb_1, in_pdb_2):
     
     # load score model
     model = DFMDock.load_from_checkpoint(
-        str(Path("./DFMDock/weights/pinder_0.ckpt")), 
+        str(Path("./weights/pinder_0.ckpt")), 
         map_location=device,
     )
 
@@ -512,9 +512,14 @@ def inference(in_pdb_1, in_pdb_2):
     batch = {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
 
     # define 
-    num_samples=1
+    num_samples=40
     num_steps=40
     use_clash_force=True
+
+    # Initialize variables to track the minimum energy and corresponding updates
+    min_energy = float("inf")
+    best_rot_update = None
+    best_tr_update = None
 
     # run 
     for i in range(num_samples):
@@ -525,8 +530,14 @@ def inference(in_pdb_1, in_pdb_2):
             device=device,
             use_clash_force=use_clash_force,
         )
+    
+        # Check if the current energy is the lowest
+        if outputs["energy"] < min_energy:
+            min_energy = outputs["energy"]
+            best_rot_update = rot_update
+            best_tr_update = tr_update
         
-    lig_aa_coords = modify_aa_coords(ligand["aa_coords"], rot_update, tr_update)
+    lig_aa_coords = modify_aa_coords(ligand["aa_coords"], best_rot_update, best_tr_update)
     rec_structure = receptor["structure"]
     lig_structure = ligand["structure"]
     lig_structure.coord = lig_aa_coords
