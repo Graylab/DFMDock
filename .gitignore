@@ -175,3 +175,5 @@ debug/
 *.yaml
 inference_gpu.sh
 submit_inference.sh
+DFMDock_guide.py
+inference_guide.py
