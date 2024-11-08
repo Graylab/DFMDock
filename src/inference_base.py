@@ -679,7 +679,7 @@ def inference(in_pdb_1, in_pdb_2):
     file.set_structure(complex_structure)
     file.write("output.pdb")
 
-    return {"energy": min_energy}
+    return {"energy": min_energy.item()}
 
 if __name__ == "__main__":
     # Initialize the parser
