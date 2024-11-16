@@ -60,29 +60,10 @@ class Score_Model(pl.LightningModule):
         self.net = Score_Net(model)
     
     def forward(self, batch):
-        # grab some input 
-        rec_pos = batch["rec_pos"]
-        lig_pos = batch["lig_pos"]
-
-        # move lig center to origin
-        center = lig_pos[..., 1, :].mean(dim=0)
-        rec_pos -= center
-        lig_pos -= center
-
-        # push to batch
-        batch["rec_pos"] = rec_pos
-        batch["lig_pos"] = lig_pos
-
-        # predict
         outputs = self.net(batch, predict=True)
-
         return outputs
 
     def loss_fn(self, batch, eps=1e-5):
-        # grab some input 
-        rec_pos = batch["rec_pos"]
-        lig_pos = batch["lig_pos"]
-
         with torch.no_grad():
             # uniformly sample a timestep
             t = torch.rand(1, device=self.device) * (1. - eps) + eps
@@ -111,19 +92,8 @@ class Score_Model(pl.LightningModule):
             batch_gt = copy.deepcopy(batch)
 
             # update poses          
-            lig_pos = self.modify_coords(lig_pos, rot_update, tr_update)
+            batch["lig_pos"] = self.modify_coords(batch["lig_pos"], rot_update, tr_update)
 
-            # get LRMSD
-            l_rmsd = get_rmsd(lig_pos[..., 1, :], batch_gt["lig_pos"][..., 1, :])
-
-            # move lig center to origin
-            center = lig_pos[..., 1, :].mean(dim=0)
-            rec_pos -= center
-            lig_pos -= center
-
-            # save noised state
-            batch["rec_pos"] = rec_pos
-            batch["lig_pos"] = lig_pos
         
         # predict score based on the current state
         if self.grad_energy:
@@ -215,14 +185,9 @@ class Score_Model(pl.LightningModule):
         else: 
             el_loss = torch.tensor(0.0, device=self.device) 
 
-
-        # confidence loss
-        label = (l_rmsd < 5.0).float()
-        conf_loss = bce_logits_loss(energy_noised, label)
-        
         # total losses
-        loss = tr_loss + rot_loss + ec_loss + el_loss + ires_loss + conf_loss
-        losses = {"tr_loss": tr_loss, "rot_loss": rot_loss, "ec_loss": ec_loss, "el_loss": el_loss, "ires_loss": ires_loss, "conf_loss": conf_loss, "loss": loss}
+        loss = tr_loss + rot_loss + ec_loss + el_loss + ires_loss
+        losses = {"tr_loss": tr_loss, "rot_loss": rot_loss, "ec_loss": ec_loss, "el_loss": el_loss, "ires_loss": ires_loss, "loss": loss}
 
         return losses
 
@@ -324,15 +289,6 @@ def main(conf: DictConfig):
         dataset='dips_train',
         crop_size=500,
     )
-
-    #dataset = PinderDataset(
-    #    data_dir='/scratch4/jgray21/lchu11/data/pinder/train',
-    #    test_split='pinder_s',
-    #    training=True,
-    #    use_esm=True,
-    #    crop_size=800,
-    #)
-
 
     subset_indices = [0]
     subset = data.Subset(dataset, subset_indices)

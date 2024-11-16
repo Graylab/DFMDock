@@ -18,7 +18,7 @@ from scipy.spatial.transform import Rotation
 from utils.geometry import axis_angle_to_matrix, matrix_to_axis_angle
 from utils.residue_constants import restype_3to1, sequence_to_onehot, restype_order_with_x
 from utils.metrics import compute_metrics
-from models.score_model import Score_Model
+from models.score_model_mlsb import Score_Model
 
 
 def set_seed(seed=42):
@@ -215,15 +215,11 @@ def get_batch_from_inputs(inputs, batch_converter, esm_model, device):
     rec_pos = torch.from_numpy(inputs['receptor']['bb_coords']).float().to(device)
     lig_pos = torch.from_numpy(inputs['ligand']['bb_coords']).float().to(device)
 
-    # is homomer
-    is_homomer = inputs['receptor']['seq'] == inputs['ligand']['seq'] 
-
     batch = {
         'rec_x': rec_x,
         'lig_x': lig_x,
         'rec_pos': rec_pos,
         'lig_pos': lig_pos,
-        'is_homomer': is_homomer,
     }
 
     # get position matrix
@@ -234,19 +230,14 @@ def get_batch_from_inputs(inputs, batch_converter, esm_model, device):
 def get_position_matrix(batch):
     rec_x = batch["rec_x"]
     lig_x = batch["lig_x"]
-    is_homomer = batch["is_homomer"]
     x = torch.cat([rec_x, lig_x], dim=0)
     
     res_id = torch.arange(x.size(0), device=x.device).long()
     asym_id = torch.zeros(x.size(0), device=x.device).long()
     asym_id[rec_x.size(0):] = 1
 
-    entity_id = torch.zeros(x.size(0), device=x.device).long()
-    if not is_homomer:
-        entity_id[rec_x.size(0):] = 1
-
     # Positional embeddings
-    position_matrix = relpos(res_id, asym_id, entity_id).to(x.device)
+    position_matrix = relpos(res_id, asym_id).to(x.device)
 
     batch["position_matrix"] = position_matrix
 
@@ -258,7 +249,7 @@ def one_hot(x, v_bins):
     am = torch.argmin(torch.abs(diffs), dim=-1)
     return torch.nn.functional.one_hot(am, num_classes=len(v_bins)).float()
 
-def relpos(res_id, asym_id, entity_id, use_chain_relative=True):
+def relpos(res_id, asym_id, use_chain_relative=True):
     max_relative_idx = 32
     pos = res_id
     asym_id_same = (asym_id[..., None] == asym_id[..., None, :])
@@ -286,9 +277,6 @@ def relpos(res_id, asym_id, entity_id, use_chain_relative=True):
         )
 
         rel_feats.append(rel_pos)
-
-        entity_id_same = (entity_id[..., None] == entity_id[..., None, :])
-        rel_feats.append(entity_id_same[..., None].to(dtype=rel_pos.dtype))
 
     else:
         boundaries = torch.arange(

@@ -349,6 +349,11 @@ class Score_Net(nn.Module):
         t = batch["t"]
         position_matrix = batch["position_matrix"]
 
+        # move to center
+        center = lig_pos[..., 1, :].mean(dim=0)
+        rec_pos = rec_pos - center
+        lig_pos = lig_pos - center
+
         # get the current complex pose
         lig_pos.requires_grad_()
         pos = torch.cat([rec_pos, lig_pos], dim=0)
@@ -362,8 +367,7 @@ class Score_Net(nn.Module):
 
         # edge feature embedding
         spatial_matrix = get_spatial_matrix(pos)
-        edge = self.spatial_embed(spatial_matrix)
-        edge += self.positional_embed(position_matrix)
+        edge = self.spatial_embed(spatial_matrix) + self.positional_embed(position_matrix)
 
         # sample edge_index and get edge_attr
         edge_index, edge_attr = get_knn_and_sample_graph(pos[..., 1, :], edge)
