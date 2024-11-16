@@ -15,7 +15,6 @@ from utils.so3_diffuser import SO3Diffuser
 from utils.r3_diffuser import R3Diffuser 
 from utils.geometry import axis_angle_to_matrix
 from datasets.ppi_mlsb_dataset import PPIDataset
-from datasets.pinder_dataset import PinderDataset
 
 #----------------------------------------------------------------------------
 # Main wrapper for training the model
