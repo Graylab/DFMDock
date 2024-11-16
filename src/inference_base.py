@@ -633,7 +633,7 @@ def inference(in_pdb_1, in_pdb_2):
     # define 
     num_samples=5
     num_steps=40
-    use_clash_force=True
+    use_clash_force=False
 
     # Initialize variables to track the minimum energy and corresponding updates
     min_energy = float("inf")
