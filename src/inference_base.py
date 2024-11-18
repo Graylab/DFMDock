@@ -631,7 +631,7 @@ def inference(in_pdb_1, in_pdb_2):
     batch = {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
 
     # define 
-    num_samples=5
+    num_samples=120
     num_steps=40
     use_clash_force=False
 
