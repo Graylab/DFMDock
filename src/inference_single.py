@@ -1,5 +1,5 @@
 import argparse
-from inference import inference
+from inference_base import inference
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Process two required PDB files.")
