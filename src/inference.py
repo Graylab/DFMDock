@@ -19,7 +19,7 @@ from utils.geometry import axis_angle_to_matrix, matrix_to_axis_angle
 from utils.residue_constants import restype_3to1, sequence_to_onehot, restype_order_with_x
 from utils.metrics import compute_metrics
 from utils.crop import get_position_matrix
-from models.DFMDock import DFMDock
+from models.score_model_mlsb import Score_Model
 
 
 def set_seed(seed=42):
@@ -451,7 +451,7 @@ def main(args):
     esm_model = esm_model.to(device).eval()
     
     # load score model
-    model = DFMDock.load_from_checkpoint(
+    model = Score_Model.load_from_checkpoint(
         args.ckpt, 
         map_location=device,
     )
@@ -510,7 +510,7 @@ def inference(in_pdb_1, in_pdb_2):
     esm_model = esm_model.to(device).eval()
     
     # load score model
-    model = DFMDock.load_from_checkpoint(
+    model = Score_Model.load_from_checkpoint(
         str(Path("./weights/pinder_0.ckpt")), 
         map_location=device,
     )
