@@ -147,15 +147,12 @@ def get_batch_from_inputs(inputs, batch_converter, esm_model, device):
     rec_pos = torch.from_numpy(inputs['receptor']['bb_coords']).float().to(device)
     lig_pos = torch.from_numpy(inputs['ligand']['bb_coords']).float().to(device)
 
-    # is homomer
-    is_homomer = inputs['receptor']['seq'] == inputs['ligand']['seq'] 
-
+    # to batch
     batch = {
         'rec_x': rec_x,
         'lig_x': lig_x,
         'rec_pos': rec_pos,
         'lig_pos': lig_pos,
-        'is_homomer': is_homomer,
     }
 
     # get position matrix
