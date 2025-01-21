@@ -609,7 +609,7 @@ def inference(in_pdb_1, in_pdb_2):
     
     # load score model
     model = Score_Model.load_from_checkpoint(
-        str(Path("./weights/pinder_0.ckpt")), 
+        str(Path("./checkpoints/dips/model_0.ckpt")), 
         map_location=device,
     )
 
