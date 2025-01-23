@@ -11,8 +11,8 @@ def main(config: DictConfig):
 
     # Imports can be nested inside @hydra.main to optimize tab completion
     # https://github.com/facebookresearch/hydra/issues/934
-    from train import train
-    from utils import utils
+    from dfmdock.train import train
+    from dfmdock.utils import utils
 
     # A couple of optional utilities:
     # - disabling python warnings

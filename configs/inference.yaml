@@ -20,3 +20,4 @@ data:
   use_clash_force: False
   use_interface: False
   use_tm_score: False
+  use_corrector: False

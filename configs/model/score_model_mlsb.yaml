@@ -1,4 +1,4 @@
-_target_: models.score_model_mlsb.Score_Model
+_target_: dfmdock.models.score_model_mlsb.Score_Model
 
 model:
   lm_embed_dim: 1301 # 1280 (ESM) + 21 (One-Hot) 
@@ -29,12 +29,12 @@ diffuser:
 experiment:
   lr: 1e-4
   weight_decay: 0.0
+  grad_energy: True
   perturb_tr: True
   perturb_rot: True
   separate_energy_loss: True
   separate_tr_loss: True
   separate_rot_loss: True
   use_interface_loss: True
-  grad_energy: False
-  use_contrastive_loss: False
+  use_contrastive_loss: True
 
