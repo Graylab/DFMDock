@@ -669,6 +669,67 @@ def inference(in_pdb_1, in_pdb_2):
 
     return {"energy": min_energy.item()}
 
+def inference_multiple_poses(in_pdb_1, in_pdb_2, num_samples=40, output_dir="output_poses"):
+    # Ensure output directory exists
+    os.makedirs(output_dir, exist_ok=True)
+
+    # Set device
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    # Load ESM model
+    esm_model, alphabet = esm.pretrained.esm2_t33_650M_UR50D()
+    batch_converter = alphabet.get_batch_converter()
+    esm_model = esm_model.to(device).eval()
+
+    # Load score model
+    model = Score_Model.load_from_checkpoint(
+        str(Path("./checkpoints/dips/model_0.ckpt")),
+        map_location=device,
+    )
+    model.to(device).eval()
+
+    # Load PDBs
+    receptor = get_info_from_pdb(in_pdb_1)
+    ligand = get_info_from_pdb(in_pdb_2)
+
+    # Prepare inputs
+    inputs = {"receptor": receptor, "ligand": ligand}
+    batch = get_batch_from_inputs(inputs, batch_converter, esm_model, device)
+    batch = {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
+
+    # Define parameters
+    num_steps = 40
+    use_clash_force = False
+
+    all_outputs = []
+
+    # Run sampling
+    for i in range(num_samples):
+        rec_pos, lig_pos, rot_update, tr_update, outputs = Euler_Maruyama_sampler(
+            model=model,
+            batch=batch.copy(),
+            num_steps=num_steps,
+            device=device,
+            use_clash_force=use_clash_force,
+        )
+
+        lig_aa_coords = modify_aa_coords(ligand["aa_coords"], inputs["ligand"]["bb_coords"], rot_update, tr_update)
+        rec_structure = receptor["structure"]
+        lig_structure = ligand["structure"]
+        lig_structure.coord = lig_aa_coords
+
+        complex_structure = combine_atom_arrays(rec_structure, lig_structure)
+
+        file = PDBFile()
+        file.set_structure(complex_structure)
+        output_pdb_path = os.path.join(output_dir, f"output_pose_{i + 1}.pdb")
+        file.write(output_pdb_path)
+
+        all_outputs.append({"pose_id": i + 1, "energy": outputs["energy"].item(), "pdb_path": output_pdb_path})
+
+    return all_outputs
+
+
 if __name__ == "__main__":
     # Initialize the parser
     parser = argparse.ArgumentParser(description="A description of what your program does")
