@@ -26,6 +26,24 @@ class ModelConfig:
 #----------------------------------------------------------------------------
 # Helper functions
 
+def get_rotat(coords):
+    # Get backbone coordinates. 
+    n_coords = coords[:, 0, :]
+    ca_coords = coords[:, 1, :]
+    c_coords = coords[:, 2, :]
+
+    # Gram-Schmidt process.
+    v1 = c_coords - ca_coords 
+    v2 = n_coords - ca_coords
+    e1 = F.normalize(v1) 
+    u2 = v2 - e1 * (torch.einsum('b i, b i -> b', e1, v2).unsqueeze(-1))
+    e2 = F.normalize(u2) 
+    e3 = torch.cross(e1, e2, dim=-1)
+
+    # Get rotations.
+    rotations=torch.stack([e1, e2, e3], dim=-1)
+    return rotations
+
 def get_clash_energy(x_receptor, x_ligand, x0=3.0, p=1.5, w_rep=5):
     """ Assign higher energy to steric clashes using an exponential penalty """
     x = torch.cdist(x_receptor, x_ligand)  # Compute pairwise distances
@@ -340,7 +358,7 @@ class Score_Net(nn.Module):
 
         # energy head
         self.to_energy = nn.Sequential(
-            nn.Linear(2*node_dim, node_dim, bias=False),
+            nn.Linear(2*node_dim + 1, node_dim, bias=False),
             nn.LayerNorm(node_dim),
             nn.SiLU(),
             nn.Linear(node_dim, 1, bias=False),
@@ -355,11 +373,7 @@ class Score_Net(nn.Module):
         )
 
         # timestep embedding
-        self.t_embed = nn.Sequential(
-            GaussianFourierProjection(embed_dim=inner_dim),
-            nn.Linear(inner_dim, inner_dim, bias=False),
-            nn.Sigmoid(),
-        )
+        self.t_embed = GaussianFourierProjection(embed_dim=inner_dim)
 
         # tr_scale mlp
         self.tr_scale = nn.Sequential(
@@ -378,6 +392,17 @@ class Score_Net(nn.Module):
             nn.Linear(inner_dim, 1, bias=False),
             nn.Softplus(),
         )
+
+        self.apply(self._init_weights)
+
+    def _init_weights(self, module):
+        if isinstance(module, nn.Linear):
+            module.weight.data.normal_(mean=0.0, std=0.02)
+            if module.bias is not None:
+                module.bias.data.zero_()
+        elif isinstance(module, nn.LayerNorm):
+            module.bias.data.zero_()
+            module.weight.data.fill_(1.0)
         
     def forward(self, batch, predict=False, return_energy=False):
         # get inputs
@@ -423,7 +448,7 @@ class Score_Net(nn.Module):
         # energy
         h_rec = repeat(node_out[:rec_pos.size(0)], 'n h -> n m h', m=lig_pos.size(0))
         h_lig = repeat(node_out[rec_pos.size(0):], 'm h -> n m h', n=rec_pos.size(0))
-        energy = self.to_energy(torch.cat([h_rec, h_lig], dim=-1)).squeeze(-1) 
+        energy = self.to_energy(torch.cat([h_rec, h_lig, d_ij.unsqueeze(-1)], dim=-1)).squeeze(-1) 
         mask_2D = (d_ij < self.cut_off).float() 
         energy = (energy * mask_2D).sum() 
 
@@ -433,25 +458,20 @@ class Score_Net(nn.Module):
         # force
         lig_pos_curr = pos_out[rec_pos.size(0):] 
         r = lig_pos[..., 1, :].detach()
-        force = lig_pos_curr - r 
-        torque = torch.cross(r, force, dim=-1)
-
-        # time embedding
-        t = self.t_embed(batch["t"])
+        f = lig_pos_curr - r # f / kT
 
         # translation
-        tr_pred = force.sum(dim=0, keepdim=True)
-        tr_norm = torch.linalg.vector_norm(tr_pred, keepdim=True)
-        tr_scale = self.tr_scale(torch.cat([tr_norm, t], dim=-1))
-        tr_score = tr_pred * tr_scale
-        force = force * tr_scale
+        tr_pred = f.sum(dim=0, keepdim=True)
 
         # rotation
-        rot_pred = torque.sum(dim=0, keepdim=True)
+        rot_pred = torch.cross(r, f, dim=-1).sum(dim=0, keepdim=True)
+
+        # scale
+        t = self.t_embed(batch["t"])
+        tr_norm = torch.linalg.vector_norm(tr_pred, keepdim=True)
+        tr_score = tr_pred / (tr_norm + 1e-6) * self.tr_scale(torch.cat([tr_norm, t], dim=-1))
         rot_norm = torch.linalg.vector_norm(rot_pred, keepdim=True)
-        rot_scale = self.rot_scale(torch.cat([rot_norm, t], dim=-1))
-        rot_score = rot_pred * rot_scale
-        torque = torque * rot_scale
+        rot_score = rot_pred / (rot_norm + 1e-6) * self.rot_scale(torch.cat([rot_norm, t], dim=-1))
 
         if predict:
             num_clashes = get_clashes(d_ij)
@@ -460,6 +480,7 @@ class Score_Net(nn.Module):
                 "tr_score": tr_score,
                 "rot_score": rot_score,
                 "energy": energy,
+                "f": f,
                 "num_clashes": num_clashes,
                 "ires": ires,
             }
@@ -477,17 +498,14 @@ class Score_Net(nn.Module):
             allow_unused=True,
         )[0]
 
-        grad_force = -dedx[..., 1, :]
-        grad_torque = torch.cross(r, grad_force, dim=-1)
+        dedx = -dedx[..., 1, :] # F / kT
         
         outputs = {
             "tr_score": tr_score,
             "rot_score": rot_score,
             "energy": energy,
-            "force": force,
-            "torque": torque,
-            "grad_force": grad_force,
-            "grad_torque": grad_torque,
+            "f": f,
+            "dedx": dedx,
             "ires": ires,
         }
 

@@ -21,3 +21,4 @@ data:
   use_interface: False
   use_tm_score: False
   use_corrector: False
+  randomize: True

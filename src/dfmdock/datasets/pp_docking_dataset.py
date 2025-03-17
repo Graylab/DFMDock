@@ -2,26 +2,34 @@ import os
 import csv
 import h5py
 import gzip
+import math
 import random
 import pickle
+import pandas as pd
 import torch
 import torch.nn.functional as F
 import pytorch_lightning as pl
 import warnings
-import biotite.structure.io as strucio
-import biotite.structure as struc
-import numpy as np
 from tqdm import tqdm
 from pathlib import Path
 from typing import Optional
-from torch.utils.data import DataLoader, Dataset, DistributedSampler
+from torch.utils.data import DataLoader, Dataset, DistributedSampler, WeightedRandomSampler
 from scipy.spatial.transform import Rotation 
 from dfmdock.utils import residue_constants
 from pinder.core.index.utils import get_index
 
-
 #----------------------------------------------------------------------------
 # Helper functions
+
+def read_excluded_ids(file_path):
+    """Read IDs from a file and return as a set."""
+    with open(file_path, "r") as f:
+        return {line.strip() for line in f}
+
+def filter_ids(original_ids, exclude_file):
+    """Filter out IDs that are present in the exclude file."""
+    excluded_ids = read_excluded_ids(exclude_file)
+    return [id for id in original_ids if id not in excluded_ids]
 
 def load_dict_data(file_path):
     with gzip.open(file_path, 'rb') as f:
@@ -284,84 +292,81 @@ def random_rotation(rec_pos, lig_pos):
     lig_pos_out = pos[rec_pos.size(0):]
     return rec_pos_out, lig_pos_out
 
-def get_info_from_pdb(pdb_path):
-    # Load the structure from the PDB file
-    structure = strucio.load_structure(pdb_path)
-
-    # Filter for only ATOM lines
-    structure = structure[~structure.hetero]
-
-    # Define backbone atoms to check
-    backbone_atoms = {"N", "CA", "C"}
-
-    # get unique chain ids
-    chain_ids = list(set(structure.chain_id))
-
-    seqs = []
-    coords = []
-    for chain in chain_ids:
-        chain_structure = structure[structure.chain_id == chain]
-
-        # Initialize a boolean mask for valid atoms
-        valid_atoms_mask = np.zeros(len(chain_structure), dtype=bool)
-
-        # Iterate over unique residues
-        for res_id in set(chain_structure.res_id):
-            # Create a mask for atoms in the current residue
-            residue_mask = (chain_structure.res_id == res_id)
-            residue_atoms = chain_structure[residue_mask]
-            
-            # Get atom names for this residue
-            residue_atom_names = set(residue_atoms.atom_name)
-            
-            # Check if all backbone atoms are present
-            if backbone_atoms.issubset(residue_atom_names):
-                # If backbone atoms are present, mark this residue as valid
-                valid_atoms_mask[residue_mask] = True
-
-        # Apply the mask to filter the structure
-        filtered_structure = chain_structure[valid_atoms_mask]
-
-        # Get the residue names (three-letter codes)
-        numbering, resn = struc.get_residues(filtered_structure)
-        seq_list = [residue_constants.restype_3to1.get(three, "X") for three in resn]
-        seq = ''.join(seq_list)
-
-        # Filter atoms by names 'N', 'CA', 'C'
-        n_atoms = filtered_structure[filtered_structure.atom_name == "N"]
-        ca_atoms = filtered_structure[filtered_structure.atom_name == "CA"]
-        c_atoms = filtered_structure[filtered_structure.atom_name == "C"]
-
-        # Ensure that the number of N, CA, and C atoms are the same and correspond to residues
-        n_res = len(seq)
-
-        # Create an array of shape (n_res, 3, 3) to hold [N, CA, C] for each residue
-        bb_coords = np.zeros((n_res, 3, 3)) # back-bone coords
-
-        # Assign coordinates for N, CA, and C atoms in the correct order
-        bb_coords[:, 0, :] = n_atoms.coord  # N
-        bb_coords[:, 1, :] = ca_atoms.coord  # CA
-        bb_coords[:, 2, :] = c_atoms.coord  # C
-
-        seqs.append(seq)
-        coords.append(bb_coords)
+def get_dihedrals(X, eps=1e-7):
+    # From https://github.com/jingraham/neurips19-graph-protein-design
     
-    return {"seqs":seqs, "coords":coords}
-    
+    X = torch.reshape(X[:, :3], [3*X.shape[0], 3])
+    dX = X[1:] - X[:-1]
+    U = F.normalize(dX, dim=-1)
+    u_2 = U[:-2]
+    u_1 = U[1:-1]
+    u_0 = U[2:]
+
+    # Backbone normals
+    n_2 = F.normalize(torch.cross(u_2, u_1, dim=-1), dim=-1)
+    n_1 = F.normalize(torch.cross(u_1, u_0, dim=-1), dim=-1)
+
+    # Angle between normals
+    cosD = torch.sum(n_2 * n_1, -1)
+    cosD = torch.clamp(cosD, -1 + eps, 1 - eps)
+    D = torch.sign(torch.sum(u_2 * n_1, -1)) * torch.acos(cosD)
+
+    # This scheme will remove phi[0], psi[-1], omega[-1]
+    D = F.pad(D, [1, 2]) 
+    D = torch.reshape(D, [-1, 3])
+    # Lift angle representations to the circle
+    D_features = torch.cat([torch.cos(D), torch.sin(D)], 1)
+    return D_features
+
+def get_orientations(X):
+    forward = F.normalize(X[1:] - X[:-1])
+    backward = F.normalize(X[:-1] - X[1:])
+    forward = F.pad(forward, [0, 0, 0, 1])
+    backward = F.pad(backward, [0, 0, 1, 0])
+    return torch.cat([forward, backward], dim=-1)
+
+def get_sidechains(X):
+    n, origin, c = X[:, 0], X[:, 1], X[:, 2]
+    c, n = F.normalize(c - origin), F.normalize(n - origin)
+    bisector = F.normalize(c + n)
+    perp = F.normalize(torch.cross(c, n, dim=-1))
+    vec = -bisector * math.sqrt(1 / 3) - perp * math.sqrt(2 / 3)
+    return vec
+
+def get_neighbors(coords, cutoff=10.0):
+    # Compute pairwise distance matrix
+    dists = torch.cdist(coords, coords)
+
+    # Count neighbors within the cutoff (excluding self, so dists > 0)
+    neighbors = (dists < cutoff).sum(dim=1) - 1
+
+    # Min-max normalization
+    min_val, max_val = neighbors.min(), neighbors.max()
+    if max_val > min_val:
+        neighbors = (neighbors - min_val) / (max_val - min_val)
+    else:
+        neighbors = torch.zeros_like(neighbors, dtype=torch.float)  # Avoid division by zero if all values are the same
+
+    return neighbors.unsqueeze(-1)
 
 #----------------------------------------------------------------------------
 # Dataset class
 
-class PPIDataset(Dataset):
+class PPDockingDataset(Dataset):
     def __init__(
         self, 
         dataset: str,
         training: bool = True,
+        use_esm: bool = True,
+        crop_size: int = 1200,
     ):
         self.dataset = dataset 
         self.training = training
+        self.use_esm = use_esm
+        self.crop_size = crop_size
 
         # Training sets
+
         if dataset == 'dips_train':
             self.data_dir = "/scratch4/jgray21/lchu11/data/dips/pt_clean"
             self.data_list = "/scratch4/jgray21/lchu11/data/dips/data_list/diffdock-pp/train.txt" 
@@ -384,13 +389,21 @@ class PPIDataset(Dataset):
 
         elif dataset == 'pinder_train':
             self.data_dir = "/scratch4/jgray21/lchu11/data/pinder/train"
+            #self.exclude_dir = "/scratch4/jgray21/lchu11/graylab_repos/DFMDock/src/dfmdock/data/pinder_train/pinder_train_exclude_ids.txt"
             self.file_list = [f.name.split('.')[0] for f in Path(self.data_dir).iterdir()]
+            #self.file_list = filter_ids(self.file_list, self.exclude_dir)
+
+            if self.use_esm:
+                self.h5f = h5py.File('/scratch16/jgray21/lchu11/data/h5_files/pinder_combined.h5', 'r')
 
         elif dataset == 'pinder_val':
             self.data_dir = "/scratch4/jgray21/lchu11/data/pinder/val"
             self.file_list = [f.name.split('.')[0] for f in Path(self.data_dir).iterdir()]
+            if self.use_esm:
+                self.h5f = h5py.File('/scratch16/jgray21/lchu11/data/h5_files/pinder_combined.h5', 'r')
 
         # Testing sets
+
         elif dataset == 'dips_test':
             self.data_dir = "/scratch4/jgray21/lchu11/data/pt/dips_test"
             self.data_list = "/scratch4/jgray21/lchu11/data/dips/data_list/geodock/test.txt" 
@@ -415,10 +428,8 @@ class PPIDataset(Dataset):
             pindex = get_index()
             self.data_dir = "/scratch4/jgray21/lchu11/data/pinder/test" 
             self.file_list = list(pindex.query('pinder_s == True').id)
-        
-        elif dataset == 'ppi3d_train':
-            self.data_dir = "/scratch4/jgray21/lchu11/data/ppi3d/gz_files"
-            self.data_list = "/scratch4/jgray21/lchu11/data/ppi3d/train.txt"
+            if self.use_esm:
+                self.h5f = h5py.File('/scratch16/jgray21/lchu11/data/h5_files/pinder_combined.h5', 'r')
 
         if self.dataset[:6] != 'pinder':
             with open(self.data_list, 'r') as f:
@@ -432,8 +443,10 @@ class PPIDataset(Dataset):
             split_string = _id.split('/')
             _id = split_string[0] + '_' + split_string[1].rsplit('.', 1)[0]
             data = torch.load(os.path.join(self.data_dir, _id+'.pt'))
+            rec_esm = data['receptor'].x.float()
             rec_seq = data['receptor'].seq
             rec_pos = data['receptor'].pos.float()
+            lig_esm = data['ligand'].x.float()
             lig_seq = data['ligand'].seq
             lig_pos = data['ligand'].pos.float()
 
@@ -444,42 +457,16 @@ class PPIDataset(Dataset):
             lig_seq = data['lig_seq']
             rec_pos = torch.from_numpy(data['rec_pos']).float()
             lig_pos = torch.from_numpy(data['lig_pos']).float()
-        
-        elif self.dataset[:5] == 'ppi3d':
-            data = load_dict_data(os.path.join(self.data_dir, f'{self.file_list[idx]}.pkl.gz'))
-            _id = data['id']
-            rec_seq = data['rec_seq']
-            lig_seq = data['lig_seq']
-            rec_pos = torch.from_numpy(data['rec_pos']).float()
-            lig_pos = torch.from_numpy(data['lig_pos']).float()
 
         else:
             _id = self.file_list[idx]
             data = torch.load(os.path.join(self.data_dir, _id+'.pt'))
+            rec_esm = data['receptor'].x.float()
             rec_seq = data['receptor'].seq
             rec_pos = data['receptor'].pos.float()
+            lig_esm = data['ligand'].x.float()
             lig_seq = data['ligand'].seq
             lig_pos = data['ligand'].pos.float()
-
-        # Shuffle and Crop for training
-        if self.training:
-            # Shuffle the order of rec and lig
-            vars_list = [(rec_seq, rec_pos), (lig_seq, lig_pos)]
-            random.shuffle(vars_list)
-            rec_seq, rec_pos = vars_list[0]
-            lig_seq, lig_pos = vars_list[1]
-
-        # Random rotation augmentation
-        rec_pos, lig_pos = random_rotation(rec_pos, lig_pos)
-
-        # move lig center to origin
-        center = lig_pos[..., 1, :].mean(dim=0)
-        rec_pos -= center
-        lig_pos -= center
-
-        # Interface residues
-        rec_ires, lig_ires = get_interface_residue_tensors(rec_pos[..., 1, :], lig_pos[..., 1, :])
-        ires = torch.cat([rec_ires, lig_ires], dim=0) 
 
         # One-Hot embeddings
         rec_onehot = torch.from_numpy(residue_constants.sequence_to_onehot(
@@ -494,26 +481,79 @@ class PPIDataset(Dataset):
             map_unknown_to_x=True,
         )).float()
 
-        # get res_id and asym_id
-        n = rec_pos.size(0) + lig_pos.size(0)
-        res_id = torch.arange(n).long()
-        asym_id = torch.zeros(n).long()
-        asym_id[rec_pos.size(0):] = 1
+        # ESM embeddings
+        if self.use_esm:
+            if self.dataset[:6] == 'pinder':
+                group = self.h5f[_id]
+                rec_esm = torch.tensor(group['rec_esm'][:])
+                lig_esm = torch.tensor(group['lig_esm'][:])
+
+            rec_x = torch.cat([rec_esm, rec_onehot], dim=-1)
+            lig_x = torch.cat([lig_esm, lig_onehot], dim=-1)
+        else:
+            rec_x = rec_onehot
+            lig_x = lig_onehot
+        
+        # Additional embeddings
+        rec_dihedrals = get_dihedrals(rec_pos)
+        #rec_orientations = get_orientations(rec_pos[..., 1, :])
+        #rec_sidechains = get_sidechains(rec_pos)
+        rec_neighbors = get_neighbors(rec_pos[..., 1, :])
+
+        lig_dihedrals = get_dihedrals(lig_pos)
+        #lig_orientations = get_orientations(lig_pos[..., 1, :])
+        #lig_sidechains = get_sidechains(lig_pos)
+        lig_neighbors = get_neighbors(lig_pos[..., 1, :])
+
+        rec_x = torch.cat([rec_x, rec_dihedrals, rec_neighbors], dim=-1)
+        lig_x = torch.cat([lig_x, lig_dihedrals, lig_neighbors], dim=-1)
+
+        # Shuffle and Crop for training
+        if self.training:
+            # Shuffle the order of rec and lig
+            vars_list = [(rec_x, rec_seq, rec_pos), (lig_x, lig_seq, lig_pos)]
+            random.shuffle(vars_list)
+            rec_x, rec_seq, rec_pos = vars_list[0]
+            lig_x, lig_seq, lig_pos = vars_list[1]
+
+            # Crop to crop_size
+            rec_x, lig_x, rec_pos, lig_pos, res_id, asym_id= self.crop_to_size(rec_x, lig_x, rec_seq, lig_seq, rec_pos, lig_pos)  
+        else:
+            # get res_id and asym_id
+            n = rec_x.size(0) + lig_x.size(0)
+            res_id = torch.arange(n).long()
+            asym_id = torch.zeros(n).long()
+            asym_id[rec_x.size(0):] = 1
+            entity_id = torch.zeros(n).long()
+            if rec_seq != lig_seq:
+                entity_id[rec_x.size(0):] = 1
 
         # Positional embeddings
         position_matrix = relpos(res_id, asym_id)
+
+        # Random rotation augmentation
+        rec_pos, lig_pos = random_rotation(rec_pos, lig_pos)
+
+        # move lig center to origin
+        center = lig_pos[..., 1, :].mean(dim=0)
+        rec_pos -= center
+        lig_pos -= center
+
+        # Interface residues
+        rec_ires, lig_ires = get_interface_residue_tensors(rec_pos[..., 1, :], lig_pos[..., 1, :])
+        ires = torch.cat([rec_ires, lig_ires], dim=0) 
 
         # Output
         output = {
             'id': _id,
             'rec_seq': rec_seq,
             'lig_seq': lig_seq,
-            'rec_onehot': rec_onehot,
-            'lig_onehot': lig_onehot,
+            'rec_x': rec_x,
+            'lig_x': lig_x,
             'rec_pos': rec_pos,
             'lig_pos': lig_pos,
-            'ires': ires,
             'position_matrix': position_matrix,
+            'ires': ires,
         }
         
         return {key: value for key, value in output.items()}
@@ -553,20 +593,26 @@ class PPIDataset(Dataset):
         lig_pos = pos[sep:]
 
         return rec_x, lig_x, rec_pos, lig_pos, res_id, asym_id
+
+
 #----------------------------------------------------------------------------
 # DataModule class
 
-class PPIDataModule(pl.LightningDataModule):
+class PPDockingDataModule(pl.LightningDataModule):
     def __init__(
         self,
         train_dataset: str = "data/",
         val_dataset: str = "data/",
+        use_esm: bool = True,
+        crop_size: int = 1200,
         batch_size: int = 1,
         **kwargs
     ):
         super().__init__()
         self.train_dataset = train_dataset
         self.val_dataset = val_dataset
+        self.use_esm = use_esm
+        self.crop_size = crop_size
         self.batch_size = batch_size
         self.num_workers = kwargs['num_workers']
         self.pin_memory = kwargs['pin_memory']
@@ -578,11 +624,15 @@ class PPIDataModule(pl.LightningDataModule):
         pass
 
     def setup(self, stage: Optional[str] = None):
-        self.data_train = PPIDataset(
+        self.data_train = PPDockingDataset(
             dataset=self.train_dataset, 
+            use_esm=self.use_esm,
+            crop_size=self.crop_size,
         )
-        self.data_val = PPIDataset(
+        self.data_val = PPDockingDataset(
             dataset=self.val_dataset, 
+            use_esm=self.use_esm,
+            crop_size=self.crop_size,
         )
 
     def train_dataloader(self):
@@ -605,11 +655,33 @@ class PPIDataModule(pl.LightningDataModule):
             shuffle=False,
         )
 
+
 #----------------------------------------------------------------------------
 # Testing
 
 if __name__ == '__main__':
-    dataset = PPIDataset(
-        dataset="pinder_s",
+    dataset = PPDockingDataset(
+        dataset="pinder_train",
     )
+    #dataset[0]
     print(dataset[0])
+        
+    
+    """
+    datamodule = InterfaceDataModule(
+        csv_path="/scratch4/jgray21/lchu11/graylab_repos/DFMDock/src/dfmdock/data/pinder_train/interface_cluster_sizes.csv",
+        train_dataset="pinder_train",
+        val_dataset="pinder_val",
+        batch_size=1,
+        num_workers=1,
+        pin_memory=False,
+    )
+    datamodule.setup()
+
+    # Get a train batch
+    train_loader = datamodule.train_dataloader()
+    print(len(train_loader))
+    for batch in train_loader:
+        print("Sampled Batch:", batch)
+        break  # Show one batch
+    """

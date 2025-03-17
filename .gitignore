@@ -168,6 +168,9 @@ checkpoints/
 lightning_logs/
 tests/
 debug/
+data/
+networks/
+pinder_train/
 *.pdb
 *.csv
 *.ipynb

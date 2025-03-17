@@ -2,8 +2,10 @@ import os
 import csv
 import h5py
 import gzip
+import math
 import random
 import pickle
+import pandas as pd
 import torch
 import torch.nn.functional as F
 import pytorch_lightning as pl
@@ -11,13 +13,23 @@ import warnings
 from tqdm import tqdm
 from pathlib import Path
 from typing import Optional
-from torch.utils.data import DataLoader, Dataset, DistributedSampler
+from torch.utils.data import DataLoader, Dataset, DistributedSampler, WeightedRandomSampler
 from scipy.spatial.transform import Rotation 
 from dfmdock.utils import residue_constants
 from pinder.core.index.utils import get_index
 
 #----------------------------------------------------------------------------
 # Helper functions
+
+def read_excluded_ids(file_path):
+    """Read IDs from a file and return as a set."""
+    with open(file_path, "r") as f:
+        return {line.strip() for line in f}
+
+def filter_ids(original_ids, exclude_file):
+    """Filter out IDs that are present in the exclude file."""
+    excluded_ids = read_excluded_ids(exclude_file)
+    return [id for id in original_ids if id not in excluded_ids]
 
 def load_dict_data(file_path):
     with gzip.open(file_path, 'rb') as f:
@@ -280,6 +292,47 @@ def random_rotation(rec_pos, lig_pos):
     lig_pos_out = pos[rec_pos.size(0):]
     return rec_pos_out, lig_pos_out
 
+def get_dihedrals(X, eps=1e-7):
+    # From https://github.com/jingraham/neurips19-graph-protein-design
+    
+    X = torch.reshape(X[:, :3], [3*X.shape[0], 3])
+    dX = X[1:] - X[:-1]
+    U = F.normalize(dX, dim=-1)
+    u_2 = U[:-2]
+    u_1 = U[1:-1]
+    u_0 = U[2:]
+
+    # Backbone normals
+    n_2 = F.normalize(torch.cross(u_2, u_1, dim=-1), dim=-1)
+    n_1 = F.normalize(torch.cross(u_1, u_0, dim=-1), dim=-1)
+
+    # Angle between normals
+    cosD = torch.sum(n_2 * n_1, -1)
+    cosD = torch.clamp(cosD, -1 + eps, 1 - eps)
+    D = torch.sign(torch.sum(u_2 * n_1, -1)) * torch.acos(cosD)
+
+    # This scheme will remove phi[0], psi[-1], omega[-1]
+    D = F.pad(D, [1, 2]) 
+    D = torch.reshape(D, [-1, 3])
+    # Lift angle representations to the circle
+    D_features = torch.cat([torch.cos(D), torch.sin(D)], 1)
+    return D_features
+
+def get_orientations(X):
+    forward = F.normalize(X[1:] - X[:-1])
+    backward = F.normalize(X[:-1] - X[1:])
+    forward = F.pad(forward, [0, 0, 0, 1])
+    backward = F.pad(backward, [0, 0, 1, 0])
+    return torch.cat([forward, backward], dim=-1)
+
+def get_sidechains(X):
+    n, origin, c = X[:, 0], X[:, 1], X[:, 2]
+    c, n = F.normalize(c - origin), F.normalize(n - origin)
+    bisector = F.normalize(c + n)
+    perp = F.normalize(torch.cross(c, n))
+    vec = -bisector * math.sqrt(1 / 3) - perp * math.sqrt(2 / 3)
+    return vec 
+
 #----------------------------------------------------------------------------
 # Dataset class
 
@@ -421,6 +474,14 @@ class PPIDataset(Dataset):
         else:
             rec_x = rec_onehot
             lig_x = lig_onehot
+        
+        # Additional embeddings
+        #rec_dihedrals = get_dihedrals(rec_pos)
+        #rec_orientations = get_orientations(rec_pos[..., 1, :])
+        #rec_sidechains = get_sidechains(rec_pos)
+        #print(rec_dihedrals.shape)
+        #print(rec_orientations.shape)
+        #print(rec_sidechains.shape)
 
         # Shuffle and Crop for training
         if self.training:
@@ -507,6 +568,8 @@ class PPIDataset(Dataset):
         lig_pos = pos[sep:]
 
         return rec_x, lig_x, rec_pos, lig_pos, res_id, asym_id
+
+
 #----------------------------------------------------------------------------
 # DataModule class
 
@@ -555,6 +618,82 @@ class PPIDataModule(pl.LightningDataModule):
             num_workers=self.num_workers,
             pin_memory=self.pin_memory,
             sampler=sampler,
+            shuffle=False,
+            #shuffle=(sampler is None),
+        )
+
+    def val_dataloader(self):
+        return DataLoader(
+            dataset=self.data_val,
+            batch_size=self.batch_size,
+            num_workers=self.num_workers,
+            pin_memory=self.pin_memory,
+            shuffle=False,
+        )
+
+class InterfaceDataModule(pl.LightningDataModule):
+    def __init__(
+        self,
+        train_dataset: str,
+        val_dataset: str,
+        csv_path: str,
+        use_esm: bool = True,
+        crop_size: int = 1200,
+        batch_size: int = 1,
+        **kwargs
+    ):
+        super().__init__()
+        self.train_dataset = train_dataset
+        self.val_dataset = val_dataset
+        self.csv_path = csv_path
+        self.use_esm = use_esm
+        self.crop_size = crop_size
+        self.batch_size = batch_size
+        self.num_workers = kwargs['num_workers']
+        self.pin_memory = kwargs['pin_memory']
+
+        self.data_train: Optional[Dataset] = None
+        self.data_val: Optional[Dataset] = None
+    
+    def prepare_data(self):
+        pass
+
+    def setup(self, stage: Optional[str] = None):
+        df = pd.read_csv(self.csv_path)
+        df["prob"] = 1 / df["interface_cluster_size"]
+        df["prob"] /= df["prob"].sum()
+
+        self.sampling_probs = torch.tensor(df["prob"])
+
+        # Convert to dictionary for fast lookup
+        self.sampling_prob_dict = df.set_index("interface_id")["prob"].to_dict()
+
+        self.interface_ids = df["interface_id"].values
+
+        self.data_train = PPIDataset(
+            dataset=self.train_dataset, 
+            use_esm=self.use_esm,
+            crop_size=self.crop_size,
+        )
+        self.data_val = PPIDataset(
+            dataset=self.val_dataset, 
+            use_esm=self.use_esm,
+            crop_size=self.crop_size,
+        )
+    
+    def get_sampling_probs(self):
+        """Lookup sampling probabilities for each interface_id in dataset"""
+        return torch.tensor([self.sampling_prob_dict[i] for i in self.interface_ids], dtype=torch.float)
+
+    def train_dataloader(self):
+        sampling_probs = self.get_sampling_probs()
+        sampler = WeightedRandomSampler(weights=sampling_probs, num_samples=len(self.data_train), replacement=True)
+        return DataLoader(
+            dataset=self.data_train,
+            batch_size=self.batch_size,
+            num_workers=self.num_workers,
+            pin_memory=self.pin_memory,
+            sampler=sampler,
             shuffle=(sampler is None),
         )
 
@@ -567,11 +706,33 @@ class PPIDataModule(pl.LightningDataModule):
             shuffle=False,
         )
 
+
 #----------------------------------------------------------------------------
 # Testing
 
 if __name__ == '__main__':
     dataset = PPIDataset(
-        dataset="dips_single",
+        dataset="pinder_train",
     )
-    print(dataset[0])
+    dataset[0]
+    #print(dataset[0])
+        
+    
+    """
+    datamodule = InterfaceDataModule(
+        csv_path="/scratch4/jgray21/lchu11/graylab_repos/DFMDock/src/dfmdock/data/pinder_train/interface_cluster_sizes.csv",
+        train_dataset="pinder_train",
+        val_dataset="pinder_val",
+        batch_size=1,
+        num_workers=1,
+        pin_memory=False,
+    )
+    datamodule.setup()
+
+    # Get a train batch
+    train_loader = datamodule.train_dataloader()
+    print(len(train_loader))
+    for batch in train_loader:
+        print("Sampled Batch:", batch)
+        break  # Show one batch
+    """

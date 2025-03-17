@@ -2,12 +2,10 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
-import math
 from dataclasses import dataclass
 from einops import repeat
-from models.egnn import E_GCL
-from models.DiT import DiTModule
-from utils.coords6d import get_coords6d
+from dfmdock.models.egnn_model import E_GCL
+from dfmdock.utils.coords6d import get_coords6d
 
 #----------------------------------------------------------------------------
 # Data class for model config
@@ -16,27 +14,36 @@ from utils.coords6d import get_coords6d
 class ModelConfig:
     lm_embed_dim: int
     positional_embed_dim: int
+    spatial_embed_dim: int
     node_dim: int
     edge_dim: int
     inner_dim: int
-    encoder_depth: int
-    decoder_depth: int
-    num_heads: int
+    depth: int
     dropout: float = 0.0
+    cut_off: float = 30.0
+    normalize: bool = False
 
 #----------------------------------------------------------------------------
 # Helper functions
 
+def get_clash_energy(x_receptor, x_ligand, x0=3.0, p=1.5, w_rep=5):
+    """ Assign higher energy to steric clashes using an exponential penalty """
+    x = torch.cdist(x_receptor, x_ligand)  # Compute pairwise distances
+    mask = (x < x0).float()
+    rep = torch.where(x < x0, (torch.abs(x0 - x) ** p) / (p * x0 ** (p - 1)), torch.tensor(0.0, device=x.device))
+    return (rep * mask).sum()
+
+
 def get_spatial_matrix(coord):
     dist, omega, theta, phi = get_coords6d(coord)
 
-    mask = dist < 22.0
+    mask = dist < 20.0
     
     num_dist_bins = 40
     num_omega_bins = 24
     num_theta_bins = 24
     num_phi_bins = 12
-    dist_bin = get_bins(dist, 3.25, 50.75, num_dist_bins)
+    dist_bin = get_bins(dist, 2.0, 20.0, num_dist_bins)
     omega_bin = get_bins(omega, -180.0, 180.0, num_omega_bins)
     theta_bin = get_bins(theta, -180.0, 180.0, num_theta_bins)
     phi_bin = get_bins(phi, 0.0, 180.0, num_phi_bins)
@@ -137,7 +144,7 @@ def get_knn_and_sample(points, knn=20, sample_size=40, epsilon=1e-10):
 #----------------------------------------------------------------------------
 # Edge seletion functions
 
-def get_knn_and_sample_graph(x, e=None, knn=20, sample_size=40):
+def get_knn_and_sample_graph(x, e, knn=20, sample_size=40):
     knn_indices, sampled_points_indices = get_knn_and_sample(x, knn=knn, sample_size=sample_size)
     if sampled_points_indices is not None:
         indices = torch.cat([knn_indices, sampled_points_indices], dim=-1)
@@ -151,56 +158,59 @@ def get_knn_and_sample_graph(x, e=None, knn=20, sample_size=40):
 
     # combine graphs
     edge_index = [edge_src, edge_dst]
+    edge_indices = torch.stack(edge_index, dim=1)
+    edge_attr = e[edge_indices[:, 0], edge_indices[:, 1]]
 
-    if e is None:
-        return edge_index
+    return edge_index, edge_attr
 
+def get_cross_graph(x, e, sep, num_self, num_cross):
+    """cross graph from the complex pose"""
+
+    # distance matrix
+    d = torch.norm((x[:, None, :] - x[None, :, :]), dim=-1)
+
+    # make sure the knn not exceed the size
+    rec_len = sep
+    lig_len = x.size(0) - sep
+
+    # self and cross
+    num_self_lig = num_self
+    num_cross_lig = num_cross
+    num_self_rec = num_self
+    num_cross_rec = num_cross
+
+    if num_self_lig > lig_len:
+        num_self_lig = lig_len
+    if num_cross_lig > rec_len:
+        num_cross_lig = rec_len
+    if num_self_rec > rec_len:
+        num_self_rec = rec_len
+    if num_cross_rec > lig_len:
+        num_cross_rec = lig_len
+
+    # intra and inter topk
+    nbhd_ranking_ii, nbhd_indices_ii = d[..., :sep, :sep].topk(num_self_rec, dim=-1, largest=False)
+    nbhd_ranking_jj, nbhd_indices_jj = d[..., sep:, sep:].topk(num_self_lig, dim=-1, largest=False)
+    nbhd_ranking_ij, nbhd_indices_ij = d[..., :sep, sep:].topk(num_cross_rec, dim=-1, largest=False)
+    nbhd_ranking_ji, nbhd_indices_ji = d[..., sep:, :sep].topk(num_cross_lig, dim=-1, largest=False)
+
+    # edge src and dst
+    edge_src_rec = torch.arange(start=0, end=rec_len, device=x.device)[..., None].repeat(1, num_self_rec+num_cross_rec)
+    edge_src_lig = torch.arange(start=rec_len, end=rec_len+lig_len, device=x.device)[..., None].repeat(1, num_self_lig+num_cross_lig)
+    edge_dst_rec = torch.cat([nbhd_indices_ii, nbhd_indices_ij + rec_len], dim=1)
+    edge_dst_lig = torch.cat([nbhd_indices_ji, nbhd_indices_jj + rec_len], dim=1)
+    edge_src = torch.cat([edge_src_rec.reshape(-1), edge_src_lig.reshape(-1)])
+    edge_dst = torch.cat([edge_dst_rec.reshape(-1), edge_dst_lig.reshape(-1)])
+
+    # combine graphs
+    edge_index = [edge_src, edge_dst]
     edge_indices = torch.stack(edge_index, dim=1)
     edge_attr = e[edge_indices[:, 0], edge_indices[:, 1]]
 
     return edge_index, edge_attr
 
 #----------------------------------------------------------------------------
-# nn Module
-
-class TimestepEmbedder(nn.Module):
-    """
-    Embeds scalar timesteps into vector representations.
-    """
-    def __init__(self, hidden_size, frequency_embedding_size=256):
-        super().__init__()
-        self.mlp = nn.Sequential(
-            nn.Linear(frequency_embedding_size, hidden_size, bias=True),
-            nn.SiLU(),
-            nn.Linear(hidden_size, hidden_size, bias=True),
-        )
-        self.frequency_embedding_size = frequency_embedding_size
-
-    @staticmethod
-    def timestep_embedding(t, dim, max_period=10000):
-        """
-        Create sinusoidal timestep embeddings.
-        :param t: a 1-D Tensor of N indices, one per batch element.
-                          These may be fractional.
-        :param dim: the dimension of the output.
-        :param max_period: controls the minimum frequency of the embeddings.
-        :return: an (N, D) Tensor of positional embeddings.
-        """
-        # https://github.com/openai/glide-text2im/blob/main/glide_text2im/nn.py
-        half = dim // 2
-        freqs = torch.exp(
-            -math.log(max_period) * torch.arange(start=0, end=half, dtype=torch.float32) / half
-        ).to(device=t.device)
-        args = t[:, None].float() * freqs[None]
-        embedding = torch.cat([torch.cos(args), torch.sin(args)], dim=-1)
-        if dim % 2:
-            embedding = torch.cat([embedding, torch.zeros_like(embedding[:, :1])], dim=-1)
-        return embedding
-
-    def forward(self, t):
-        t_freq = self.timestep_embedding(t, self.frequency_embedding_size)
-        t_emb = self.mlp(t_freq)
-        return t_emb
+# nn Modules
 
 class GaussianFourierProjection(nn.Module):
     """Gaussian random features for encoding time steps."""  
@@ -285,108 +295,6 @@ class EGNN(nn.Module):
         return h
 
 
-class EGNN_self(nn.Module):
-    def __init__(
-        self, 
-        node_dim, 
-        edge_dim=0, 
-        act_fn=nn.SiLU(), 
-        depth=4, 
-        residual=True, 
-        attention=False, 
-        normalize=False, 
-        tanh=False,
-        dropout=0.0,
-    ):
-        super(EGNN_self, self).__init__()
-        self.depth = depth
-        for i in range(depth):
-            self.add_module("EGNN_%d" % i, EGNNLayer(
-                node_dim=node_dim, 
-                edge_dim=edge_dim,
-                act_fn=act_fn, 
-                residual=residual, 
-                attention=attention,
-                normalize=normalize, 
-                tanh=tanh,
-                dropout=dropout,
-                update_coords=False,
-            )
-        )
-
-    def forward(self, h, x, edges, edge_attr=None, lig_mask=None):
-        for i in range(self.depth):
-            h, x, edge_attr = self._modules["EGNN_%d" % i](h, x, edges, edge_attr=edge_attr, lig_mask=lig_mask)
-        return h
-
-
-class CrossAttention(nn.Module):
-    def __init__(self, input_size, num_heads):
-        super(CrossAttention, self).__init__()
-        #MultiHead
-        self.MultiHead_1 = nn.MultiheadAttention(embed_dim=input_size, num_heads=num_heads)
-
-    def forward(self, input1, input2):
-        output_1, attention_weights_1 = self.MultiHead_1(input1, input2, input2)
-        return output_1, attention_weights_1
-
-
-class Encoder(nn.Module):
-    def __init__(self, node_dim, depth, dropout, num_heads=8):
-        super(Encoder, self).__init__()
-        self.intra_network = EGNN_self(
-            node_dim=node_dim, 
-            act_fn=nn.SiLU(), 
-            depth=depth, 
-            residual=True, 
-            attention=True, 
-            normalize=True, 
-            tanh=False,
-            dropout=dropout,
-        )
-
-        self.norm1 = nn.LayerNorm(node_dim)
-        self.dropout1 = nn.Dropout(p=dropout)
-        self.norm2 = nn.LayerNorm(node_dim)
-        self.dropout2 = nn.Dropout(p=dropout)
-        self.norm3 = nn.LayerNorm(node_dim)
-        self.dropout3 = nn.Dropout(p=dropout)
-
-        self.cross_attn = CrossAttention(node_dim, num_heads=num_heads)
-
-        self.ff = nn.Sequential(
-            nn.Linear(node_dim, 2*node_dim),
-            nn.SiLU(),
-            nn.Dropout(p=dropout),
-            nn.Linear(node_dim*2, node_dim),
-        )
-
-    def forward(self, rec_x, lig_x, rec_pos, lig_pos):
-        rec_edge_index = get_knn_and_sample_graph(rec_pos[:, 1])
-        lig_edge_index = get_knn_and_sample_graph(lig_pos[:, 1])
-        _rec_x = rec_x
-        _lig_x = lig_x
-        rec_x = self.norm1(self.dropout1(self.intra_network(rec_x, rec_pos[:, 1], rec_edge_index)) + _rec_x)
-        lig_x = self.norm1(self.dropout1(self.intra_network(lig_x, lig_pos[:, 1], lig_edge_index)) + _lig_x)
-
-        # Cross-Attention
-        _rec_x = rec_x
-        _lig_x = lig_x
-        rec_attn, rec_attn_weights = self.cross_attn(rec_x, lig_x)
-        lig_attn, lig_attn_weights = self.cross_attn(lig_x, rec_x)
-        rec_x = self.norm2(self.dropout2(rec_attn) + _rec_x)
-        lig_x = self.norm2(self.dropout2(lig_attn) + _lig_x)
-
-        # Feed-Forward
-        _rec_x = rec_x
-        _lig_x = lig_x
-        rec_x = self.norm3(self.dropout3(self.ff(rec_x)) + _rec_x)
-        lig_x = self.norm3(self.dropout3(self.ff(lig_x)) + _lig_x)
-        x = torch.cat([rec_x, lig_x], dim=0)
-
-        return x
-
-
 #----------------------------------------------------------------------------
 # Main score network
 
@@ -398,44 +306,35 @@ class Score_Net(nn.Module):
     ):
         super().__init__()
         lm_embed_dim = conf.lm_embed_dim
+        spatial_embed_dim = conf.spatial_embed_dim
         positional_embed_dim = conf.positional_embed_dim
         node_dim = conf.node_dim
         edge_dim = conf.edge_dim
         inner_dim = conf.inner_dim
-        encoder_depth = conf.encoder_depth
-        decoder_depth = conf.decoder_depth
-        num_heads = conf.num_heads
+        depth = conf.depth
         dropout = conf.dropout
+        normalize = conf.normalize
         
-        # node embedding
+        self.cut_off = conf.cut_off
+        
+        # single init embedding
         self.single_embed = nn.Linear(lm_embed_dim, node_dim, bias=False)
 
-        # edge embedding
-        self.edge_embed = nn.Linear(positional_embed_dim, edge_dim, bias=False)
+        # pair init embedding
+        self.spatial_embed = nn.Linear(spatial_embed_dim, edge_dim, bias=False)
+        self.positional_embed = nn.Linear(positional_embed_dim, edge_dim, bias=False)
 
-        # sigma embedding
-        self.sigma_data = 0.5
-
-        # encoder
-        self.encoder = Encoder(
+        # denoising score network
+        self.network = EGNN(
             node_dim=node_dim, 
-            depth=encoder_depth, 
+            edge_dim=edge_dim, 
+            act_fn=nn.SiLU(), 
+            depth=depth, 
+            residual=True, 
+            attention=True, 
+            normalize=normalize, 
+            tanh=False,
             dropout=dropout,
-        )
-
-        # transition
-        self.node_embed = nn.Sequential(
-            nn.LayerNorm(node_dim + 3),
-            nn.Linear(node_dim + 3, node_dim, bias=False),
-        )
-        self.pos_to_node = nn.Linear(3, node_dim, bias=False)
-
-        # decoder
-        self.decoder = DiTModule(
-            dim=node_dim, 
-            pairwise_state_dim=edge_dim, 
-            num_heads=num_heads, 
-            depth=decoder_depth,
         )
 
         # energy head
@@ -446,84 +345,70 @@ class Score_Net(nn.Module):
             nn.Linear(node_dim, 1, bias=False),
         )
 
-        # force head
-        self.to_force = nn.Sequential(
+        # interface residue head
+        self.to_ires = nn.Sequential(
+            nn.Linear(node_dim, node_dim, bias=False),
             nn.LayerNorm(node_dim),
-            nn.Linear(node_dim, 3, bias=False),
+            nn.SiLU(),
+            nn.Linear(node_dim, 1, bias=False),
         )
 
+        self.apply(self._init_weights)
+
+    def _init_weights(self, module):
+        if isinstance(module, nn.Linear):
+            module.weight.data.normal_(mean=0.0, std=0.02)
+            if module.bias is not None:
+                module.bias.data.zero_()
+        elif isinstance(module, nn.LayerNorm):
+            module.bias.data.zero_()
+            module.weight.data.fill_(1.0)
+        
     def forward(self, batch, predict=False, return_energy=False):
         # get inputs
         rec_x = batch["rec_x"] 
         lig_x = batch["lig_x"] 
         rec_pos = batch["rec_pos"] 
         lig_pos = batch["lig_pos"] 
-        pos = batch["pos"] 
-        sigma = batch["sigma"]
         position_matrix = batch["position_matrix"]
 
-        # single embed
-        rec_x = self.single_embed(rec_x)
-        lig_x = self.single_embed(lig_x)
-
-        # encoder
-        x = self.encoder(rec_x, lig_x, rec_pos, lig_pos)
-
-        # pre-conditioning
-        c_skip = self.sigma_data ** 2 / (sigma ** 2 + self.sigma_data ** 2)
-        c_out = sigma * self.sigma_data / (sigma ** 2 + self.sigma_data ** 2).sqrt()
-        c_in = 1 / (self.sigma_data ** 2 + sigma ** 2).sqrt()
-        c_noise = sigma.log() / 4
+        # move to center
+        center = lig_pos[..., 1, :].mean(dim=0)
+        rec_pos = rec_pos - center
+        lig_pos = lig_pos - center
 
         # get the current complex pose
-        pos = pos.view(-1, 3)
-        pos.requires_grad_()
+        lig_pos.requires_grad_()
+        pos = torch.cat([rec_pos, lig_pos], dim=0)
 
         # node feature embedding
-        x = x.unsqueeze(1).repeat(1, 3, 1)
-        one_hot = torch.eye(3, device=x.device).unsqueeze(0).repeat(x.size(0), 1, 1)
-
-        # node embedding
-        node = torch.cat([x, one_hot], dim=-1)
-        node = self.node_embed(node) # [n, 3, c]
-        node = node.view(-1, node.size(-1)) # [3n, c]
-
-        # scale pos
-        pos_in = c_in * pos
-        node = node + self.pos_to_node(pos_in)
+        x = torch.cat([rec_x, lig_x], dim=0)
+        node = self.single_embed(x) # [n, c]
 
         # edge feature embedding
-        position_matrix = position_matrix.repeat(3, 3, 1) # [3n, 3n, c]
-        edge = self.edge_embed(position_matrix) # [3n, 3n, c]
+        spatial_matrix = get_spatial_matrix(pos)
+        edge = self.spatial_embed(spatial_matrix) + self.positional_embed(position_matrix)
 
-        # decoder
-        node = self.decoder(node, c_noise, bias=edge) # [R+L, H]
+        # sample edge_index and get edge_attr
+        edge_index, edge_attr = get_knn_and_sample_graph(pos[..., 1, :], edge)
+
+        # main network 
+        node = self.network(node, pos[..., 1, :], edge_index, edge_attr) # [R+L, H]
+
+        # interface residue
+        ires = self.to_ires(node)
 
         # energy
-        energy = self.to_energy(node).sum()
+        energy = self.to_energy(node)
+        energy = energy.sum()
 
         if return_energy:
             return energy
 
-        # force
-        f = self.to_force(node)
-
-        # denoised pos
-        denoised_pos = c_skip * pos + c_out * f
-
-        if predict:
-            outputs = {
-                "energy": energy,
-                "f": f,
-                "pos": denoised_pos,
-            }
-
-            return outputs
-
         # dedx
-        gradient = torch.autograd.grad(
+        dedx = torch.autograd.grad(
             outputs=energy, 
-            inputs=pos, 
+            inputs=lig_pos, 
             grad_outputs=torch.ones_like(energy),
             create_graph=self.training, 
             retain_graph=self.training,
@@ -531,13 +416,22 @@ class Score_Net(nn.Module):
             allow_unused=True,
         )[0]
 
-        dedx = -gradient # F / kT
-        
+        f = -dedx[..., 1, :] 
+
+        # translation
+        tr_score = f.mean(dim=0, keepdim=True)
+
+        # rotation
+        r = lig_pos[..., 1, :].detach()
+        rot_score = torch.cross(r, f, dim=-1).mean(dim=0, keepdim=True)
+
         outputs = {
+            "tr_score": tr_score,
+            "rot_score": rot_score,
             "energy": energy,
             "f": f,
             "dedx": dedx,
-            "pos": denoised_pos,
+            "ires": ires,
         }
 
         return outputs
@@ -549,31 +443,28 @@ if __name__ == '__main__':
     conf = ModelConfig(
         lm_embed_dim=1280,
         positional_embed_dim=68,
+        spatial_embed_dim=100,
         node_dim=24,
         edge_dim=12,
         inner_dim=24,
-        encoder_depth=2,
-        decoder_depth=2,
-        num_heads=8,
+        depth=2,
     )
 
     model = Score_Net(conf)
 
-    rec_x = torch.randn(45, 1280)
+    rec_x = torch.randn(40, 1280)
     lig_x = torch.randn(5, 1280)
-    rec_pos = torch.randn(45, 3, 3)
+    rec_pos = torch.randn(40, 3, 3)
     lig_pos = torch.randn(5, 3, 3)
-    pos = torch.randn(50, 3, 3)
-    sigma = torch.tensor([0.5])
-    position_matrix = torch.zeros(50, 50, 68)
+    t = torch.tensor([0.5])
+    position_matrix = torch.zeros(45, 45, 68)
 
     batch = {
         "rec_x": rec_x,
         "lig_x": lig_x,
         "rec_pos": rec_pos,
         "lig_pos": lig_pos,
-        "pos": pos,
-        "sigma": sigma,
+        "t": t,
         "position_matrix": position_matrix,
     }
 

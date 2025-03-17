@@ -26,24 +26,35 @@ class ModelConfig:
 #----------------------------------------------------------------------------
 # Helper functions
 
+def smooth_decay(dij):
+    return torch.exp(-(dij - 10).clamp(min=0))  # Exponential decay beyond 10Å
+
+
+def interaction_mask(d_ij, cutoff_distance=10.0, exponent=2):
+    # Apply decay for long-range interactions
+    decay_weight = (cutoff_distance / d_ij).clamp(max=1.0) ** exponent  # Decay factor
+    mask = torch.where(d_ij > cutoff_distance, decay_weight, torch.ones_like(d_ij))  # Apply decay
+    return mask
+
+
 def get_clash_energy(x_receptor, x_ligand, x0=3.0, p=1.5, w_rep=5):
     """ Assign higher energy to steric clashes using an exponential penalty """
     x = torch.cdist(x_receptor, x_ligand)  # Compute pairwise distances
     mask = (x < x0).float()
-    rep = torch.where(x < x0, (torch.abs(x0 - x) ** p) / (p * x0 ** (p - 1)), torch.tensor(0.0, device=x.device))
-    return (rep * mask).sum()
+    rep = torch.where(x < x0, (torch.abs(x0 - x) ** p) / (p * x * (p - 1)), torch.tensor(0.0, device=x.device))
+    return rep 
 
 
-def get_spatial_matrix(coord, cut_off=20.0):
+def get_spatial_matrix(coord):
     dist, omega, theta, phi = get_coords6d(coord)
 
-    mask = dist < cut_off
+    mask = dist < 22.0
     
     num_dist_bins = 40
     num_omega_bins = 24
     num_theta_bins = 24
     num_phi_bins = 12
-    dist_bin = get_bins(dist, 3.0, cut_off, num_dist_bins)
+    dist_bin = get_bins(dist, 3.25, 50.75, num_dist_bins)
     omega_bin = get_bins(omega, -180.0, 180.0, num_omega_bins)
     theta_bin = get_bins(theta, -180.0, 180.0, num_theta_bins)
     phi_bin = get_bins(phi, 0.0, 180.0, num_phi_bins)
@@ -296,6 +307,30 @@ class EGNN(nn.Module):
         return h, x, edge_attr
 
 
+class InteractionEnergy(nn.Module):
+    def __init__(self, dim):
+        super().__init__()
+        
+        # MLPs for repulsion and attraction
+        self.mlp_rep = nn.Sequential(nn.Linear(dim * 2, dim), nn.SiLU(), nn.Linear(dim, 1))
+        self.mlp_atr = nn.Sequential(nn.Linear(dim * 2, dim), nn.SiLU(), nn.Linear(dim, 1))
+    
+    def forward(self, hi, hj, dij):
+        x = torch.cat([hi, hj], dim=-1)
+
+        # Repulsion: active only for d < 3
+        mask_rep = (dij < 3).float()
+        g_rep = F.softplus(self.mlp_rep(x)).squeeze(-1)
+
+        # Attraction: smoothly decays beyond 10
+        mask_atr = (dij < 10).float() + smooth_decay(dij)
+        g_atr = self.mlp_atr(x).squeeze(-1)
+
+        # Compute interaction energy
+        Eij = mask_rep * g_rep + mask_atr * g_atr
+        return Eij
+
+
 #----------------------------------------------------------------------------
 # Main score network
 
@@ -339,19 +374,15 @@ class Score_Net(nn.Module):
         )
 
         # energy head
-        self.to_energy = nn.Sequential(
-            nn.Linear(2*node_dim, node_dim, bias=False),
-            nn.LayerNorm(node_dim),
-            nn.SiLU(),
-            nn.Linear(node_dim, 1, bias=False),
-        )
+        self.to_energy = InteractionEnergy(dim=node_dim)
 
         # interface residue head
         self.to_ires = nn.Sequential(
-            nn.Linear(node_dim, node_dim, bias=False),
-            nn.LayerNorm(node_dim),
+            nn.Linear(node_dim, 2*node_dim),
             nn.SiLU(),
-            nn.Linear(node_dim, 1, bias=False),
+            nn.Linear(2*node_dim, 2*node_dim),
+            nn.SiLU(),
+            nn.Linear(2*node_dim, 1),
         )
 
         # timestep embedding
@@ -364,7 +395,6 @@ class Score_Net(nn.Module):
         # tr_scale mlp
         self.tr_scale = nn.Sequential(
             nn.Linear(inner_dim + 1, inner_dim, bias=False),
-            nn.LayerNorm(inner_dim),
             nn.SiLU(),
             nn.Linear(inner_dim, 1, bias=False),
             nn.Softplus(),
@@ -373,11 +403,21 @@ class Score_Net(nn.Module):
         # rot_scale mlp
         self.rot_scale = nn.Sequential(
             nn.Linear(inner_dim + 1, inner_dim, bias=False),
-            nn.LayerNorm(inner_dim),
             nn.SiLU(),
             nn.Linear(inner_dim, 1, bias=False),
             nn.Softplus(),
         )
+
+        self.apply(self._init_weights)
+
+    def _init_weights(self, module):
+        if isinstance(module, nn.Linear):
+            module.weight.data.normal_(mean=0.0, std=0.02)
+            if module.bias is not None:
+                module.bias.data.zero_()
+        elif isinstance(module, nn.LayerNorm):
+            module.bias.data.zero_()
+            module.weight.data.fill_(1.0)
         
     def forward(self, batch, predict=False, return_energy=False):
         # get inputs
@@ -385,6 +425,7 @@ class Score_Net(nn.Module):
         lig_x = batch["lig_x"] 
         rec_pos = batch["rec_pos"] 
         lig_pos = batch["lig_pos"] 
+        t = batch["t"]
         position_matrix = batch["position_matrix"]
 
         # move to center
@@ -394,6 +435,7 @@ class Score_Net(nn.Module):
 
         # get ca distance matrix 
         d_ij = torch.norm((rec_pos[:, None, 1, :] - lig_pos[None, :, 1, :]), dim=-1)
+        clash_energy = get_clash_energy(rec_pos[..., 1, :], lig_pos[..., 1, :])
 
         # get the current complex pose
         lig_pos.requires_grad_()
@@ -404,7 +446,7 @@ class Score_Net(nn.Module):
         node = self.single_embed(x) # [n, c]
 
         # edge feature embedding
-        spatial_matrix = get_spatial_matrix(pos, cut_off=self.cut_off)
+        spatial_matrix = get_spatial_matrix(pos)
         edge = self.spatial_embed(spatial_matrix) + self.positional_embed(position_matrix)
 
         # sample edge_index and get edge_attr
@@ -423,9 +465,8 @@ class Score_Net(nn.Module):
         # energy
         h_rec = repeat(node_out[:rec_pos.size(0)], 'n h -> n m h', m=lig_pos.size(0))
         h_lig = repeat(node_out[rec_pos.size(0):], 'm h -> n m h', n=rec_pos.size(0))
-        energy = self.to_energy(torch.cat([h_rec, h_lig], dim=-1)).squeeze(-1) 
-        mask_2D = (d_ij < self.cut_off).float() 
-        energy = (energy * mask_2D).sum() 
+        energy = self.to_energy(h_rec, h_lig, d_ij)
+        energy = energy.sum()
 
         if return_energy:
             return energy
@@ -433,34 +474,27 @@ class Score_Net(nn.Module):
         # force
         lig_pos_curr = pos_out[rec_pos.size(0):] 
         r = lig_pos[..., 1, :].detach()
-        force = lig_pos_curr - r 
-        torque = torch.cross(r, force, dim=-1)
-
-        # time embedding
-        t = self.t_embed(batch["t"])
+        f = lig_pos_curr - r # f / kT
 
         # translation
-        tr_pred = force.sum(dim=0, keepdim=True)
-        tr_norm = torch.linalg.vector_norm(tr_pred, keepdim=True)
-        tr_scale = self.tr_scale(torch.cat([tr_norm, t], dim=-1))
-        tr_score = tr_pred * tr_scale
-        force = force * tr_scale
+        tr_pred = f.sum(dim=0, keepdim=True)
 
         # rotation
-        rot_pred = torque.sum(dim=0, keepdim=True)
+        rot_pred = torch.cross(r, f, dim=-1).sum(dim=0, keepdim=True)
+
+        # scale
+        t = self.t_embed(t)
+        tr_norm = torch.linalg.vector_norm(tr_pred, keepdim=True)
+        tr_score = tr_pred / (tr_norm + 1e-6) * self.tr_scale(torch.cat([tr_norm, t], dim=-1))
         rot_norm = torch.linalg.vector_norm(rot_pred, keepdim=True)
-        rot_scale = self.rot_scale(torch.cat([rot_norm, t], dim=-1))
-        rot_score = rot_pred * rot_scale
-        torque = torque * rot_scale
+        rot_score = rot_pred / (rot_norm + 1e-6) * self.rot_scale(torch.cat([rot_norm, t], dim=-1))
 
         if predict:
-            num_clashes = get_clashes(d_ij)
-
             outputs = {
                 "tr_score": tr_score,
                 "rot_score": rot_score,
                 "energy": energy,
-                "num_clashes": num_clashes,
+                "f": f,
                 "ires": ires,
             }
 
@@ -477,17 +511,14 @@ class Score_Net(nn.Module):
             allow_unused=True,
         )[0]
 
-        grad_force = -dedx[..., 1, :]
-        grad_torque = torch.cross(r, grad_force, dim=-1)
+        dedx = -dedx[..., 1, :] # F / kT
         
         outputs = {
             "tr_score": tr_score,
             "rot_score": rot_score,
             "energy": energy,
-            "force": force,
-            "torque": torque,
-            "grad_force": grad_force,
-            "grad_torque": grad_torque,
+            "f": f,
+            "dedx": dedx,
             "ires": ires,
         }
 

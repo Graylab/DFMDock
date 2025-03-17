@@ -18,7 +18,6 @@ from scipy.spatial.transform import Rotation
 from utils.geometry import axis_angle_to_matrix, matrix_to_axis_angle
 from utils.residue_constants import restype_3to1, sequence_to_onehot, restype_order_with_x
 from utils.metrics import compute_metrics
-from utils.crop import get_position_matrix
 from models.score_model_mlsb import Score_Model
 
 
@@ -34,24 +33,6 @@ def set_seed(seed=42):
 
 #----------------------------------------------------------------------------
 # output functions
-def save_pdb(pred):
-    # set output directory
-    out_pdb =  os.path.join(self.data_conf.out_pdb_dir, pred._id + '_p' + pred.index + '.pdb')
-
-    seq1 = pred.rec_seq
-    seq2 = pred.lig_seq
-        
-    coords = torch.cat([pred.rec_pos, pred.lig_pos], dim=0)
-    coords = get_full_coords(coords)
-
-    # get total len
-    total_len = coords.size(0)
-
-    # check seq len
-    assert len(seq1) + len(seq2) == total_len
-
-    # get pdb
-    save_PDB(out_pdb=out_pdb, coords=coords, seq=seq1+seq2, delim=len(seq1)-1)
 
 def combine_atom_arrays(atom_array_1, atom_array_2):
     """
@@ -98,28 +79,115 @@ def get_info_from_pdb(pdb_path):
     # Get the atomic coordinates as a NumPy array
     aa_coords = structure.coord  # all-atom coordinates
 
+    # Define backbone atoms to check
+    backbone_atoms = {"N", "CA", "C"}
+
+    # Initialize a boolean mask for valid atoms
+    valid_atoms_mask = np.zeros(len(structure), dtype=bool)
+
+    # Iterate over unique residues
+    for res_id in set(structure.res_id):
+        # Create a mask for atoms in the current residue
+        residue_mask = (structure.res_id == res_id)
+        residue_atoms = structure[residue_mask]
+        
+        # Get atom names for this residue
+        residue_atom_names = set(residue_atoms.atom_name)
+        
+        # Check if all backbone atoms are present
+        if backbone_atoms.issubset(residue_atom_names):
+            # If backbone atoms are present, mark this residue as valid
+            valid_atoms_mask[residue_mask] = True
+
+    # Apply the mask to filter the structure
+    filtered_structure = structure[valid_atoms_mask]
+
     # Get the residue names (three-letter codes)
-    numbering, resn = struc.get_residues(structure)
+    numbering, resn = struc.get_residues(filtered_structure)
     seq_list = [restype_3to1.get(three, "X") for three in resn]
     seq = ''.join(seq_list)
 
     # Filter atoms by names 'N', 'CA', 'C'
-    n_atoms = structure[structure.atom_name == "N"]
-    ca_atoms = structure[structure.atom_name == "CA"]
-    c_atoms = structure[structure.atom_name == "C"]
+    n_atoms = filtered_structure[filtered_structure.atom_name == "N"]
+    ca_atoms = filtered_structure[filtered_structure.atom_name == "CA"]
+    c_atoms = filtered_structure[filtered_structure.atom_name == "C"]
 
     # Ensure that the number of N, CA, and C atoms are the same and correspond to residues
-    n_res = min(len(n_atoms), len(ca_atoms), len(c_atoms))
+    n_res = len(seq)
 
     # Create an array of shape (n_res, 3, 3) to hold [N, CA, C] for each residue
     bb_coords = np.zeros((n_res, 3, 3)) # back-bone coords
 
     # Assign coordinates for N, CA, and C atoms in the correct order
-    bb_coords[:, 0, :] = n_atoms.coord[:n_res]  # N
-    bb_coords[:, 1, :] = ca_atoms.coord[:n_res]  # CA
-    bb_coords[:, 2, :] = c_atoms.coord[:n_res]  # C
+    bb_coords[:, 0, :] = n_atoms.coord  # N
+    bb_coords[:, 1, :] = ca_atoms.coord  # CA
+    bb_coords[:, 2, :] = c_atoms.coord  # C
     
     return {"structure": structure, "seq":seq, "aa_coords":aa_coords, "bb_coords":bb_coords}
+
+def get_native(pdb_path):
+    # Load the structure from the PDB file
+    structure = strucio.load_structure(pdb_path)
+
+    # Filter for only ATOM lines
+    structure = structure[~structure.hetero]
+
+    # Define backbone atoms to check
+    backbone_atoms = {"N", "CA", "C"}
+
+    # Initialize a boolean mask for valid atoms
+    valid_atoms_mask = np.zeros(len(structure), dtype=bool)
+
+    # Iterate over unique residues
+    for res_id in set(structure.res_id):
+        # Create a mask for atoms in the current residue
+        residue_mask = (structure.res_id == res_id)
+        residue_atoms = structure[residue_mask]
+        
+        # Get atom names for this residue
+        residue_atom_names = set(residue_atoms.atom_name)
+        
+        # Check if all backbone atoms are present
+        if backbone_atoms.issubset(residue_atom_names):
+            # If backbone atoms are present, mark this residue as valid
+            valid_atoms_mask[residue_mask] = True
+
+    # Apply the mask to filter the structure
+    filtered_structure = structure[valid_atoms_mask]
+
+    # Initialize a list to store backbone coordinates for each chain
+    backbone_coords_list = []
+
+    # Loop through each unique chain ID to extract backbone coordinates
+    for chain_id in np.unique(filtered_structure.chain_id):
+        # Select atoms for the current chain
+        chain_atoms = filtered_structure[filtered_structure.chain_id == chain_id]
+
+        # Filter atoms by names 'N', 'CA', 'C'
+        n_atoms = chain_atoms[chain_atoms.atom_name == "N"]
+        ca_atoms = chain_atoms[chain_atoms.atom_name == "CA"]
+        c_atoms = chain_atoms[chain_atoms.atom_name == "C"]
+
+        # Ensure that the number of N, CA, and C atoms are the same and correspond to residues
+        n_res = len(n_atoms)
+
+        # Create an array of shape (n_res, 3, 3) to hold [N, CA, C] for each residue
+        bb_coords = np.zeros((n_res, 3, 3)) # back-bone coords
+
+        # Assign coordinates for N, CA, and C atoms in the correct order
+        bb_coords[:, 0, :] = n_atoms.coord  # N
+        bb_coords[:, 1, :] = ca_atoms.coord  # CA
+        bb_coords[:, 2, :] = c_atoms.coord  # C
+        
+        # Append only the backbone coordinates to the list
+        backbone_coords_list.append(bb_coords)
+
+    # Stack all chains into a single numpy array and convert to a torch tensor
+    # This will create a list of numpy arrays, which we then convert to tensors
+    backbone_coords_tensor = [torch.from_numpy(coords).float() for coords in backbone_coords_list]
+
+    return backbone_coords_tensor
+
 
 def get_batch_from_inputs(inputs, batch_converter, esm_model, device):
     # One-Hot embeddings
@@ -147,7 +215,6 @@ def get_batch_from_inputs(inputs, batch_converter, esm_model, device):
     rec_pos = torch.from_numpy(inputs['receptor']['bb_coords']).float().to(device)
     lig_pos = torch.from_numpy(inputs['ligand']['bb_coords']).float().to(device)
 
-    # to batch
     batch = {
         'rec_x': rec_x,
         'lig_x': lig_x,
@@ -159,6 +226,70 @@ def get_batch_from_inputs(inputs, batch_converter, esm_model, device):
     batch = get_position_matrix(batch)
 
     return batch
+
+def get_position_matrix(batch):
+    rec_x = batch["rec_x"]
+    lig_x = batch["lig_x"]
+    x = torch.cat([rec_x, lig_x], dim=0)
+    
+    res_id = torch.arange(x.size(0), device=x.device).long()
+    asym_id = torch.zeros(x.size(0), device=x.device).long()
+    asym_id[rec_x.size(0):] = 1
+
+    # Positional embeddings
+    position_matrix = relpos(res_id, asym_id).to(x.device)
+
+    batch["position_matrix"] = position_matrix
+
+    return batch
+
+def one_hot(x, v_bins):
+    reshaped_bins = v_bins.view(((1,) * len(x.shape)) + (len(v_bins),))
+    diffs = x[..., None] - reshaped_bins
+    am = torch.argmin(torch.abs(diffs), dim=-1)
+    return torch.nn.functional.one_hot(am, num_classes=len(v_bins)).float()
+
+def relpos(res_id, asym_id, use_chain_relative=True):
+    max_relative_idx = 32
+    pos = res_id
+    asym_id_same = (asym_id[..., None] == asym_id[..., None, :])
+    offset = pos[..., None] - pos[..., None, :]
+
+    clipped_offset = torch.clamp(
+        offset + max_relative_idx, 0, 2 * max_relative_idx
+    )
+
+    rel_feats = []
+    if use_chain_relative:
+        final_offset = torch.where(
+            asym_id_same, 
+            clipped_offset,
+            (2 * max_relative_idx + 1) * 
+            torch.ones_like(clipped_offset)
+        )
+
+        boundaries = torch.arange(
+            start=0, end=2 * max_relative_idx + 2, device=res_id.device
+        )
+        rel_pos = one_hot(
+            final_offset,
+            boundaries,
+        )
+
+        rel_feats.append(rel_pos)
+
+    else:
+        boundaries = torch.arange(
+            start=0, end=2 * max_relative_idx + 1, device=res_id.device
+        )
+        rel_pos = one_hot(
+            clipped_offset, boundaries,
+        )
+        rel_feats.append(rel_pos)
+
+    rel_feat = torch.cat(rel_feats, dim=-1).float()
+
+    return rel_feat
 
 def get_esm_rep(seq_prim, batch_converter, esm_model, device):
     # Use ESM-1b format.
@@ -174,39 +305,6 @@ def get_esm_rep(seq_prim, batch_converter, esm_model, device):
     
     return rep[0, 1:-1, :]
 
-def _calculate_bin_centers(boundaries: torch.Tensor):
-    step = boundaries[1] - boundaries[0]
-    bin_centers = boundaries + step / 2
-    bin_centers = torch.cat(
-        [bin_centers, (bin_centers[-1] + step).unsqueeze(-1)], dim=0
-    )
-    return bin_centers
-
-def compute_tm(
-    logits: torch.Tensor,
-    max_bin: int = 31,
-    no_bins: int = 64,
-    eps: float = 1e-8,
-) -> torch.Tensor:
-    boundaries = torch.linspace(
-        0, max_bin, steps=(no_bins - 1), device=logits.device
-    )
-
-    bin_centers = _calculate_bin_centers(boundaries)
-    clipped_n = max(logits.size(0) + logits.size(1), 19)
-
-    d0 = 1.24 * (clipped_n - 15) ** (1.0 / 3) - 1.8
-
-    probs = F.softmax(logits, dim=-1)
-
-    tm_per_bin = 1.0 / (1 + (bin_centers ** 2) / (d0 ** 2))
-    predicted_tm_term = torch.sum(probs * tm_per_bin, dim=-1)
-
-    max_sum = max(torch.mean(predicted_tm_term, dim=0).max(), torch.mean(predicted_tm_term, dim=1).max())
-
-    return max_sum
-
-
 #----------------------------------------------------------------------------
 # coords functions
 
@@ -221,8 +319,8 @@ def randomize_pose(x1, x2):
     device=x1.device
 
     # get center of mass
-    c1 = torch.mean(x1, dim=(0, 1))
-    c2 = torch.mean(x2, dim=(0, 1))
+    c1 = torch.mean(x1[..., 1, :], dim=0)
+    c2 = torch.mean(x2[..., 1, :], dim=0)
 
     # get rotat update
     rot_update = torch.from_numpy(Rotation.random().as_matrix()).float().to(device)
@@ -242,7 +340,7 @@ def randomize_pose(x1, x2):
     return x2, tr_update, rot_update
 
 def modify_coords(x, rot, tr):
-    center = torch.mean(x, dim=(0, 1))
+    center = torch.mean(x[..., 1, :], dim=0, keepdim=True)
     rot = axis_angle_to_matrix(rot).squeeze()
     
     # update rotation
@@ -253,8 +351,8 @@ def modify_coords(x, rot, tr):
     
     return x
 
-def modify_aa_coords(x, rot, tr):
-    center = x.mean(axis=0)
+def modify_aa_coords(x, bb_coords, rot, tr):
+    center = bb_coords[:, 1].mean(axis=0)
     rot = axis_angle_to_matrix(rot).squeeze().cpu().numpy()
     
     # update rotation
@@ -376,6 +474,11 @@ def run(args, model, inputs, batch, device):
     metrics_list = []
     id = inputs["id"]
 
+    if args.native_dir is not None:
+        native = get_native(f'{args.native_dir}/{id}.pdb')
+    else:
+        native = (torch.from_numpy(inputs['receptor']['bb_coords']).float(), torch.from_numpy(inputs['ligand']['bb_coords']).float())
+
     for i in range(args.num_samples):
         rec_pos, lig_pos, rot_update, tr_update, output = Euler_Maruyama_sampler(
             model=model, 
@@ -390,16 +493,14 @@ def run(args, model, inputs, batch, device):
         
         # get metrics
         metrics = {'id': id, 'index': str(i)}
-        pred = (rec_pos.detach().cpu(), lig_pos.detach().cpu())
-        native = (torch.from_numpy(inputs['receptor']['bb_coords']).float(), torch.from_numpy(inputs['ligand']['bb_coords']).float())
+        pred = [rec_pos.detach().cpu(), lig_pos.detach().cpu()]
         metrics.update(compute_metrics(pred, native))
         metrics.update({'energy': output['energy'].item()})
-        metrics.update({'confidence_logits': output['confidence_logits'].item()})
         metrics.update({'num_clashes': output['num_clashes'].item()})
         metrics_list.append(metrics)
 
         # get aa structure
-        lig_aa_coords = modify_aa_coords(inputs["ligand"]["aa_coords"], rot_update, tr_update)
+        lig_aa_coords = modify_aa_coords(inputs["ligand"]["aa_coords"], inputs["ligand"]["bb_coords"], rot_update, tr_update)
         rec_structure = inputs["receptor"]["structure"]
         lig_structure = inputs["ligand"]["structure"]
         lig_structure.coord = lig_aa_coords
@@ -530,9 +631,9 @@ def inference(in_pdb_1, in_pdb_2):
     batch = {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
 
     # define 
-    num_samples=40
+    num_samples=120
     num_steps=40
-    use_clash_force=True
+    use_clash_force=False
 
     # Initialize variables to track the minimum energy and corresponding updates
     min_energy = float("inf")
@@ -555,7 +656,7 @@ def inference(in_pdb_1, in_pdb_2):
             best_rot_update = rot_update
             best_tr_update = tr_update
         
-    lig_aa_coords = modify_aa_coords(ligand["aa_coords"], best_rot_update, best_tr_update)
+    lig_aa_coords = modify_aa_coords(ligand["aa_coords"], inputs["ligand"]["bb_coords"], best_rot_update, best_tr_update)
     rec_structure = receptor["structure"]
     lig_structure = ligand["structure"]
     lig_structure.coord = lig_aa_coords
@@ -565,6 +666,8 @@ def inference(in_pdb_1, in_pdb_2):
     file = PDBFile()
     file.set_structure(complex_structure)
     file.write("output.pdb")
+
+    return {"energy": min_energy.item()}
 
 if __name__ == "__main__":
     # Initialize the parser
@@ -585,6 +688,7 @@ if __name__ == "__main__":
     parser.add_argument("--use_clash_force", action='store_true', help="Use clash force") 
     parser.add_argument("--noise_annealing", action='store_true', help="Use clash force") 
     parser.add_argument("--seed", type=int, help="Random seed", default=42) 
+    parser.add_argument("--native_dir", type=str, default=None, help="Path to the file or directory. If not provided, defaults to False.")
 
     # Parse the arguments
     args = parser.parse_args()

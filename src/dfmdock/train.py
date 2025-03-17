@@ -1,4 +1,5 @@
 import hydra
+import wandb
 from typing import List, Optional
 from omegaconf import DictConfig
 from pytorch_lightning import (
@@ -44,6 +45,7 @@ def train(config: DictConfig) -> Optional[float]:
                 log.info(f"Instantiating callback <{cb_conf._target_}>")
                 callbacks.append(hydra.utils.instantiate(cb_conf))
 
+
     # Init lightning loggers
     logger: List[Logger] = []
     if "logger" in config:
@@ -68,6 +70,8 @@ def train(config: DictConfig) -> Optional[float]:
         callbacks=callbacks,
         logger=logger,
     )
+
+    #wandb.watch(model, log="gradients")
 
     # Train the model
     log.info("Starting training!")

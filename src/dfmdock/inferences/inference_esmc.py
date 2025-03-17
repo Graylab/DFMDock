@@ -13,9 +13,10 @@ from dataclasses import dataclass
 from tqdm import tqdm
 from torch.utils import data
 from scipy.spatial.transform import Rotation 
-from dfmdock.models.score_model_mlsb import Score_Model
-from dfmdock.models.rank_model_mlsb import Rank_Model
-from dfmdock.datasets.ppi_mlsb_dataset import PPIDataset
+from esm.models.esmc import ESMC
+from esm.sdk.api import ESMProtein, LogitsConfig
+from dfmdock.models.score_model_esmc import Score_Model
+from dfmdock.datasets.ppi_dataset import PPIDataset
 from dfmdock.utils.geometry import axis_angle_to_matrix, matrix_to_axis_angle
 from dfmdock.utils.pdb import save_PDB, place_fourth_atom 
 from dfmdock.utils.metrics import compute_metrics
@@ -111,27 +112,21 @@ class Sampler:
         # set device
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         
-        # load score model
-        self.score_model = Score_Model.load_from_checkpoint(
-            self.data_conf.score_model, 
+        # load models
+        self.model = Score_Model.load_from_checkpoint(
+            self.data_conf.ckpt, 
             map_location=self.device,
         )
-        self.score_model.eval()
-        self.score_model.to(self.device)
+        self.model.eval()
+        self.model.to(self.device)
 
-        # load rank model
-        self.rank_model = Rank_Model.load_from_checkpoint(
-            self.data_conf.rank_model, 
-            map_location=self.device,
-        )
-        self.rank_model.eval()
-        self.rank_model.to(self.device)
+        # Load esm
+        #self.client = ESMC.from_pretrained("esmc_600m").to(self.device) # or "cpu"
         
         # get testset
         testset = PPIDataset(
             dataset=self.data_conf.dataset, 
             training=False, 
-            use_esm=self.data_conf.use_esm,
         )
 
         # load dataset
@@ -204,7 +199,15 @@ class Sampler:
 
         # get pdb
         save_PDB(out_pdb=out_pdb, coords=coords, seq=seq1+seq2, delim=len(seq1)-1)
-    
+
+    def get_esm_rep(self, seq_prim):
+        protein = ESMProtein(sequence=seq_prim)
+        protein_tensor = self.client.encode(protein)
+        logits_output = self.client.logits(
+           protein_tensor, LogitsConfig(sequence=True, return_embeddings=True)
+        )
+        return logits_output.embeddings[0, 1:-1, :]
+
     def run_sampling(self):
         metrics_list = []
         transforms_list = []
@@ -213,17 +216,21 @@ class Sampler:
             _id = batch['id'][0]
             rec_seq = batch['rec_seq'][0]
             lig_seq = batch['lig_seq'][0]
-            rec_x = batch['rec_x'].to(self.device).squeeze(0)
-            lig_x = batch['lig_x'].to(self.device).squeeze(0)
+            rec_onehot = batch['rec_onehot'].to(self.device).squeeze(0)
+            lig_onehot = batch['lig_onehot'].to(self.device).squeeze(0)
             rec_pos = batch['rec_pos'].to(self.device).squeeze(0)
             lig_pos = batch['lig_pos'].to(self.device).squeeze(0)
             position_matrix = batch['position_matrix'].to(self.device).squeeze(0)
+            rec_x = self.model.get_esm_rep(rec_seq)
+            lig_x = self.model.get_esm_rep(lig_seq)
+            rec_x = torch.cat([rec_x, rec_onehot], dim=-1).to(self.device)
+            lig_x = torch.cat([lig_x, lig_onehot], dim=-1).to(self.device)
 
             batch = {
                 "rec_x": rec_x,
                 "lig_x": lig_x,
-                "rec_pos": rec_pos.clone().detach(),
-                "lig_pos": lig_pos.clone().detach(),
+                "rec_pos": rec_pos.detach().clone(),
+                "lig_pos": lig_pos.detach().clone(),
                 "position_matrix": position_matrix,
             }
 
@@ -238,7 +245,7 @@ class Sampler:
 
             if self.data_conf.get_gt_energy:
                 batch["t"] = torch.zeros(1, device=self.device) + 1e-5
-                output = self.score_model(batch)
+                output = self.model(batch)
 
                 metrics = {'id': _id}
                 metrics.update(self.get_metrics([rec_pos, lig_pos], [rec_pos, lig_pos]))
@@ -249,7 +256,7 @@ class Sampler:
             else:
                 # run 
                 for i in range(self.data_conf.num_samples):
-                    _rec_pos, _lig_pos, energy, num_clashes, logits = self.Euler_Maruyama_sampler(
+                    _rec_pos, _lig_pos, energy, num_clashes = self.Euler_Maruyama_sampler(
                         batch=batch,
                         batch_size=1,
                         eps=1e-3,
@@ -271,7 +278,6 @@ class Sampler:
                     metrics.update(self.get_metrics([_rec_pos[-1], _lig_pos[-1]], [rec_pos, lig_pos]))
                     metrics.update({'energy': energy.item()})
                     metrics.update({'num_clashes': num_clashes.item()})
-                    metrics.update({'logits': logits.item()})
                     metrics_list.append(metrics)
 
                     if self.data_conf.out_trj:
@@ -281,8 +287,7 @@ class Sampler:
                         self.save_pdb(pred)
 
         return metrics_list
-
-
+     
     def Euler_Maruyama_sampler(
         self,
         batch,
@@ -318,11 +323,11 @@ class Sampler:
                 t = torch.ones(batch_size, device=self.device) * time_step
 
                 batch["t"] = t
-                batch["rec_pos"] = rec_pos.clone().detach()
-                batch["lig_pos"] = lig_pos.clone().detach()
+                batch["rec_pos"] = rec_pos.detach().clone()
+                batch["lig_pos"] = lig_pos.detach().clone()
 
                 # get predictions
-                output = self.score_model(batch) 
+                output = self.model(batch) 
 
                 if not is_last:
                     tr_noise_scale = self.data_conf.tr_noise_scale
@@ -332,7 +337,7 @@ class Sampler:
                     rot_noise_scale = 0.0
 
                 if self.perturb_rot:
-                    rot = self.score_model.so3_diffuser.torch_reverse(
+                    rot = self.model.so3_diffuser.torch_reverse(
                         score_t=output["rot_score"].detach(),
                         t=t.item(),
                         dt=dt,
@@ -343,7 +348,7 @@ class Sampler:
                     rot = torch.zeros((1, 3), device=self.device)
 
                 if self.perturb_tr:
-                    tr = self.score_model.r3_diffuser.torch_reverse(
+                    tr = self.model.r3_diffuser.torch_reverse(
                         score_t=output["tr_score"].detach(),
                         t=t.item(),
                         dt=dt,
@@ -357,19 +362,19 @@ class Sampler:
 
                 # clash
                 if self.data_conf.use_clash_force:
-                    clash_force = self.clash_force(rec_pos.clone().detach(), lig_pos.clone().detach())
+                    clash_force = self.clash_force(rec_pos.detach().clone(), lig_pos.detach().clone())
                     lig_pos = lig_pos + clash_force
 
                 if is_last:
-                    batch["rec_pos"] = rec_pos.clone().detach()
-                    batch["lig_pos"] = lig_pos.clone().detach()
-                    logits = self.rank_model(batch) 
+                    batch["rec_pos"] = rec_pos.detach().clone()
+                    batch["lig_pos"] = lig_pos.detach().clone()
+                    output = self.model(batch) 
 
                 # save coordinates
                 rec_trj.append(rec_pos)         
                 lig_trj.append(lig_pos)
                 
-        return rec_trj, lig_trj, output["energy"], output["num_clashes"], logits
+        return rec_trj, lig_trj, output["energy"], output["num_clashes"]
 
     def randomize_pose(self, x1, x2):
         # get center of mass
@@ -434,7 +439,7 @@ class Sampler:
     
 #----------------------------------------------------------------------------
 # Main
-@hydra.main(version_base=None, config_path="/scratch4/jgray21/lchu11/graylab_repos/DFMDock/configs", config_name="inference_rank") 
+@hydra.main(version_base=None, config_path="/scratch4/jgray21/lchu11/graylab_repos/DFMDock/configs", config_name="inference") 
 def main(config: DictConfig):
     # Print the entire configuration
     print(OmegaConf.to_yaml(config))

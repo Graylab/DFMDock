@@ -6,11 +6,12 @@ import torch.nn.functional as F
 import pytorch_lightning as pl
 import numpy as np
 import random
-import importlib
 from torch.utils import data
 from torch_geometric.loader import DataLoader
 from scipy.spatial.transform import Rotation
 from omegaconf import DictConfig
+from dfmdock.models.score_model import Score_Model
+from dfmdock.models.score_net import Score_Net
 from dfmdock.utils.so3_diffuser import SO3Diffuser 
 from dfmdock.utils.r3_diffuser import R3Diffuser 
 from dfmdock.utils.geometry import axis_angle_to_matrix, matrix_to_axis_angle
@@ -21,7 +22,7 @@ from dfmdock.datasets.ppi_mlsb_dataset import PPIDataset
 #----------------------------------------------------------------------------
 # Main wrapper for training the model
 
-class Score_Model(pl.LightningModule):
+class Rank_Model(pl.LightningModule):
     def __init__(
         self,
         model,
@@ -58,15 +59,16 @@ class Score_Model(pl.LightningModule):
         # contact
         self.use_contact_loss = experiment.use_contact_loss
 
-        # diffuser
-        if self.perturb_tr:
-            self.r3_diffuser = R3Diffuser(diffuser.r3)
-        if self.perturb_rot:
-            self.so3_diffuser = SO3Diffuser(diffuser.so3)
-
-        # net
-        module = importlib.import_module(f"dfmdock.models.{model.file_name}")
-        self.net = module.Score_Net(model)
+        # load score model
+        self.score_model = Score_Model.load_from_checkpoint(
+            experiment.ckpt, 
+            map_location=self.device,
+        )
+        self.score_model.eval()
+        self.score_model.to(self.device)
+        
+        # score net
+        self.score_net = Score_Net(model)
     
     def forward(self, batch):
         outputs = self.net(batch, predict=True)
@@ -78,164 +80,35 @@ class Score_Model(pl.LightningModule):
 
     def loss_fn(self, batch, eps=1e-5):
         with torch.no_grad():
-            # uniformly sample a timestep
-            t = torch.rand(1, device=self.device) * (1. - eps) + eps
-            batch["t"] = t
-
-            # sample perturbation for translation and rotation
-            if self.perturb_tr:
-                tr_score_scale = self.r3_diffuser.score_scaling(t.item())
-                tr_update, tr_score_gt = self.r3_diffuser.forward_marginal(t.item())
-                tr_update = torch.from_numpy(tr_update).float().to(self.device)
-                tr_score_gt = torch.from_numpy(tr_score_gt).float().to(self.device)
-            else:
-                tr_update = np.zeros(3)
-                tr_update = torch.from_numpy(tr_update).float().to(self.device)
-
-            if self.perturb_rot:
-                rot_score_scale = self.so3_diffuser.score_scaling(t.item())
-                rot_update, rot_score_gt = self.so3_diffuser.forward_marginal(t.item())
-                rot_update = torch.from_numpy(rot_update).float().to(self.device)
-                rot_score_gt = torch.from_numpy(rot_score_gt).float().to(self.device)
-            else:
-                rot_update = np.zeros(3)
-                rot_update = torch.from_numpy(rot_update).float().to(self.device)
-
             # save gt state
             batch_gt = copy.deepcopy(batch)
 
-            # update poses          
-            batch["lig_pos"] = self.modify_coords(batch["lig_pos"], rot_update, tr_update)
+            # sample pose
+            batch["rec_pos"], batch["lig_pos"] = self.Euler_Maruyama_sampler(batch)
 
             # get dockq
-            #dockq = get_DockQ((batch["rec_pos"], batch["lig_pos"]), (batch_gt["rec_pos"], batch_gt["lig_pos"]))
-            #print(dockq)
+            dockq = get_DockQ((batch["rec_pos"], batch["lig_pos"]), (batch_gt["rec_pos"], batch_gt["lig_pos"]))
 
-        # predict score based on the current state
-        if self.grad_energy:
-            outputs = self.net(batch)
+        energy_noised = self.score_net(batch, return_energy=True)
 
-            # grab some outputs
-            tr_score = outputs["tr_score"]
-            rot_score = outputs["rot_score"]
-            f = outputs["f"]
-            dedx = outputs["dedx"]
-            energy_noised = outputs["energy"]
-
-            print(f.norm())
-            print(dedx.norm())
-            #print(energy_noised)
-
-            # energy conservation loss
-            if self.separate_energy_loss:
-                f_mag = torch.norm(f, dim=-1, keepdim=True)
-                f_dir = f / (f_mag + 1e-6)
-
-                dedx_mag = torch.norm(dedx, dim=-1, keepdim=True)
-                dedx_dir = dedx / (dedx_mag + 1e-6)
-
-                ec_dir_loss = torch.mean((f_dir - dedx_dir)**2)
-                ec_mag_loss = torch.mean((f_mag - dedx_mag)**2)
-                ec_loss = 0.5 * (ec_dir_loss + ec_mag_loss)
-                #ec_loss = ec_dir_loss + ec_mag_loss
-                
-            else:
-                ec_loss = torch.mean((dedx - f)**2)
-        else:
-            outputs = self.net(batch, predict=True)
-
-            # grab some outputs
-            tr_score = outputs["tr_score"]
-            rot_score = outputs["rot_score"]
-            energy_noised = outputs["energy"]
-            
-            # energy conservation loss
-            ec_loss = torch.tensor(0.0, device=self.device)
-
-        # translation loss
-        if self.perturb_tr:
-            if self.separate_tr_loss:
-                gt_tr_mag = torch.norm(tr_score_gt, dim=-1, keepdim=True)
-                gt_tr_dir = tr_score_gt / (gt_tr_mag + 1e-6)
-
-                pred_tr_mag = torch.norm(tr_score, dim=-1, keepdim=True)
-                pred_tr_dir = tr_score / (pred_tr_mag + 1e-6)
-
-                tr_dir_loss = torch.mean((pred_tr_dir - gt_tr_dir)**2)
-                tr_mag_loss = torch.mean((pred_tr_mag - gt_tr_mag)**2 / tr_score_scale**2)
-                tr_loss = 0.5 * (tr_dir_loss + tr_mag_loss)
-                #tr_loss = tr_dir_loss + 0.1 * tr_mag_loss
-
-            else:
-                tr_loss = torch.mean((tr_score - tr_score_gt)**2 / tr_score_scale**2)
-        else:
-            tr_loss = torch.tensor(0.0, device=self.device)
-
-        # rotation loss
-        if self.perturb_rot:
-            if self.separate_rot_loss:
-                gt_rot_mag = torch.norm(rot_score_gt, dim=-1, keepdim=True)
-                gt_rot_dir = rot_score_gt / (gt_rot_mag + 1e-6)
-
-                pred_rot_mag = torch.norm(rot_score, dim=-1, keepdim=True)
-                pred_rot_dir = rot_score / (pred_rot_mag + 1e-6)
-
-                rot_dir_loss = torch.mean((pred_rot_dir - gt_rot_dir)**2)
-                rot_mag_loss = torch.mean((pred_rot_mag - gt_rot_mag)**2 / rot_score_scale**2)
-                rot_loss = 0.5 * (rot_dir_loss + rot_mag_loss)
-                #rot_loss = rot_dir_loss + 0.1 * rot_mag_loss
-
-            else:
-                rot_loss = torch.mean((rot_score - rot_score_gt)**2 / rot_score_scale**2)
-        else:
-            rot_loss = torch.tensor(0.0, device=self.device)
-        
         # contrastive loss
         # modified from https://github.com/yilundu/ired_code_release/blob/main/diffusion_lib/denoising_diffusion_pytorch_1d.py
         if self.use_contrastive_loss:
-            energy_gt = self.net(batch_gt, return_energy=True)
+            energy_gt = self.score_net(batch_gt, return_energy=True)
             energy_stack = torch.stack([energy_gt, energy_noised], dim=-1)
             target = torch.zeros([], device=energy_stack.device)
             el_loss = F.cross_entropy(-1 * energy_stack, target.long(), reduction='none')
             # weight by dockq
-            #el_loss = el_loss * (1.0 - dockq)
+            el_loss = el_loss * (1.0 - dockq)
         else: 
             el_loss = torch.tensor(0.0, device=self.device) 
 
-        # interface loss
-        bce_logits_loss = nn.BCEWithLogitsLoss()
-        if self.use_interface_loss:
-            ires_loss = bce_logits_loss(outputs['ires'], batch['ires'])
-        else:
-            ires_loss = torch.tensor(0.0, device=self.device)
-        
-        # contact loss
-        if self.use_contact_loss:
-            gt_dist = torch.norm(batch_gt["rec_pos"][:, None, 1, :] - batch_gt["lig_pos"][None, :, 1, :], dim=-1)
-            cut_off = 10.0
-            gt_contact = (gt_dist < cut_off).float()
-            contact_loss = bce_logits_loss(outputs['contact'], gt_contact.unsqueeze(-1))
-        else:
-            contact_loss = torch.tensor(0.0, device=self.device)
-
         # total losses
-        loss = tr_loss + rot_loss + 0.1 * (ec_loss + el_loss + ires_loss + contact_loss)
+        loss = el_loss
         losses = {
-            "tr_loss": tr_loss, 
-            "rot_loss": rot_loss, 
-            "ec_loss": ec_loss, 
             "el_loss": el_loss, 
-            "ires_loss": ires_loss,
-            "contact_loss": contact_loss,
             "loss": loss,
         }
-
-        if (self.perturb_tr and self.separate_tr_loss):
-            losses["tr_dir_loss"] = tr_dir_loss
-            losses["tr_mag_loss"] = tr_mag_loss
-        if (self.perturb_rot and self.separate_rot_loss):
-            losses["rot_dir_loss"] = rot_dir_loss
-            losses["rot_mag_loss"] = rot_mag_loss
 
         return losses
 
@@ -362,7 +235,7 @@ class Score_Model(pl.LightningModule):
         batch,
         batch_size=1, 
         eps=1e-3,
-        num_steps=40,
+        num_steps=20,
     ):
         # initialize time steps
         t = torch.ones(batch_size, device=self.device)
@@ -388,7 +261,7 @@ class Score_Model(pl.LightningModule):
                 batch["lig_pos"] = lig_pos.detach().clone()
 
                 # get predictions
-                output = self.net(batch, predict=True) 
+                output = self.score_model(batch) 
 
                 if not is_last:
                     tr_noise_scale = 0.5
@@ -398,7 +271,7 @@ class Score_Model(pl.LightningModule):
                     rot_noise_scale = 0.0
 
                 if self.perturb_rot:
-                    rot = self.so3_diffuser.torch_reverse(
+                    rot = self.score_model.so3_diffuser.torch_reverse(
                         score_t=output["rot_score"].detach(),
                         t=t.item(),
                         dt=dt,
@@ -408,7 +281,7 @@ class Score_Model(pl.LightningModule):
                     rot = torch.zeros((1, 3), device=self.device)
 
                 if self.perturb_tr:
-                    tr = self.r3_diffuser.torch_reverse(
+                    tr = self.score_model.r3_diffuser.torch_reverse(
                         score_t=output["tr_score"].detach(),
                         t=t.item(),
                         dt=dt,
@@ -460,20 +333,20 @@ def get_rmsd(pred, label):
 #----------------------------------------------------------------------------
 # Testing run
 
-@hydra.main(version_base=None, config_path="/scratch4/jgray21/lchu11/graylab_repos/DFMDock/configs/model", config_name="score_model.yaml")
+@hydra.main(version_base=None, config_path="/scratch4/jgray21/lchu11/graylab_repos/DFMDock/configs/model", config_name="rank_model.yaml")
 def main(conf: DictConfig):
     dataset = PPIDataset(
         dataset='pinder_train',
-        crop_size=1200,
+        crop_size=500,
     )
 
-    subset_indices = [1273]
+    subset_indices = [0]
     subset = data.Subset(dataset, subset_indices)
 
     #load dataset
     dataloader = DataLoader(subset)
     
-    model = Score_Model(
+    model = Rank_Model(
         model=conf.model, 
         diffuser=conf.diffuser,
         experiment=conf.experiment

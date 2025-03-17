@@ -13,7 +13,7 @@ from dataclasses import dataclass
 from tqdm import tqdm
 from torch.utils import data
 from scipy.spatial.transform import Rotation 
-from dfmdock.models.score_model_mlsb import Score_Model
+from dfmdock.models.score_model_DiT import Score_Model
 from dfmdock.datasets.ppi_mlsb_dataset import PPIDataset
 from dfmdock.utils.geometry import axis_angle_to_matrix, matrix_to_axis_angle
 from dfmdock.utils.pdb import save_PDB, place_fourth_atom 
@@ -213,8 +213,8 @@ class Sampler:
             batch = {
                 "rec_x": rec_x,
                 "lig_x": lig_x,
-                "rec_pos": rec_pos.clone().detach(),
-                "lig_pos": lig_pos.clone().detach(),
+                "rec_pos": rec_pos.detach().clone(),
+                "lig_pos": lig_pos.detach().clone(),
                 "position_matrix": position_matrix,
             }
 
@@ -273,6 +273,95 @@ class Sampler:
         return metrics_list
 
 
+    def reverse_diffusion_sampler(
+        self,
+        batch,
+        batch_size=1, 
+        eps=1e-3,
+        ode=False,
+    ):
+        # coordinates and energy saver
+        rec_trj = []
+        lig_trj = []
+
+        # initialize time steps
+        #t = torch.ones(batch_size, device=self.device)
+        #time_steps = torch.linspace(1., eps, self.data_conf.num_steps, device=self.device)
+        #dt = time_steps[0] - time_steps[1]
+
+        time_steps = np.linspace(1.0, 0.0, self.data_conf.num_steps)
+        tr_sigma = self.model.r3_diffuser.sigma(time_steps)
+        rot_sigma = self.model.so3_diffuser.sigma(time_steps)
+        tr_sigma = tr_sigma ** 2 - np.concatenate((tr_sigma[1:], [0])) ** 2
+        rot_sigma = rot_sigma ** 2 - np.concatenate((rot_sigma[1:], [0])) ** 2
+        tr_sigma = torch.from_numpy(tr_sigma).float()
+        rot_sigma = torch.from_numpy(rot_sigma).float()
+
+        # get initial pose
+        rec_pos = batch["rec_pos"] 
+        lig_pos = batch["lig_pos"] 
+
+        # randomly initialize coordinates
+        rec_pos, lig_pos, rot_update, tr_update = self.randomize_pose(rec_pos, lig_pos)
+        
+        # save initial coordinates 
+        rec_trj.append(rec_pos)
+        lig_trj.append(lig_pos)
+
+        # run reverse sde 
+        with torch.no_grad():
+            for i, time_step in enumerate(tqdm((time_steps))):  
+                # get current time step 
+                is_last = i == len(time_steps) - 1   
+                t = torch.ones(batch_size, device=self.device) * time_step
+
+                batch["t"] = t
+                batch["rec_pos"] = rec_pos.detach().clone()
+                batch["lig_pos"] = lig_pos.detach().clone()
+
+                # get predictions
+                output = self.model(batch) 
+
+                if not is_last:
+                    tr_noise_scale = self.data_conf.tr_noise_scale
+                    rot_noise_scale = self.data_conf.rot_noise_scale
+                else:
+                    tr_noise_scale = 0.0
+                    rot_noise_scale = 0.0
+
+                if self.perturb_rot:
+                    rot_z = torch.randn(1, 3, device=self.device)
+                    rot_score = output["rot_score"].detach()
+                    rot = rot_sigma[i] * rot_score + rot_sigma[i] ** 0.5 * rot_z * rot_noise_scale
+                else:
+                    rot = torch.zeros((1, 3), device=self.device)
+
+                if self.perturb_tr:
+                    tr_z = torch.randn(1, 3, device=self.device)
+                    tr_score = output["tr_score"].detach()
+                    tr = tr_sigma[i] * tr_score + tr_sigma[i] ** 0.5 * tr_z * tr_noise_scale
+                else:
+                    tr = torch.zeros((1, 3), device=self.device)
+
+                lig_pos = self.modify_coords(lig_pos, rot, tr)
+
+                # clash
+                if self.data_conf.use_clash_force:
+                    clash_force = self.clash_force(rec_pos.detach().clone(), lig_pos.detach().clone())
+                    lig_pos = lig_pos + clash_force
+
+                if is_last:
+                    batch["rec_pos"] = rec_pos.detach().clone()
+                    batch["lig_pos"] = lig_pos.detach().clone()
+                    output = self.model(batch) 
+
+                # save coordinates
+                rec_trj.append(rec_pos)         
+                lig_trj.append(lig_pos)
+                
+        return rec_trj, lig_trj, output["energy"], output["num_clashes"]
+     
+
     def Euler_Maruyama_sampler(
         self,
         batch,
@@ -294,8 +383,7 @@ class Sampler:
         lig_pos = batch["lig_pos"] 
 
         # randomly initialize coordinates
-        if self.data_conf.randomize:
-            rec_pos, lig_pos, rot_update, tr_update = self.randomize_pose(rec_pos, lig_pos)
+        rec_pos, lig_pos, rot_update, tr_update = self.randomize_pose(rec_pos, lig_pos)
         
         # save initial coordinates 
         rec_trj.append(rec_pos)

@@ -1,13 +1,14 @@
-import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
+import random
 from dataclasses import dataclass
 from einops import repeat
-from models.egnn_clean import E_GCL
-from models.pair_module import PairModule
-from utils.coords6d import get_coords6d
+from boltz.model.modules.trunk import PairformerModule
+from boltz.model.layers.transition import Transition
+from dfmdock.models.egnn import E_GCL
+from dfmdock.utils.coords6d import get_coords6d
 
 #----------------------------------------------------------------------------
 # Data class for model config
@@ -17,18 +18,41 @@ class ModelConfig:
     lm_embed_dim: int
     positional_embed_dim: int
     spatial_embed_dim: int
-    contact_embed_dim: int
     node_dim: int
     edge_dim: int
     inner_dim: int
     encoder_depth: int
     decoder_depth: int
+    num_recycles: int = 0
     dropout: float = 0.0
     cut_off: float = 30.0
     normalize: bool = False
+    activation_checkpointing: bool = False
 
 #----------------------------------------------------------------------------
 # Helper functions
+
+def get_dist_matrix(rec_pos, lig_pos):
+    coord = torch.cat([rec_pos, lig_pos], dim=0)
+    dist, omega, theta, phi = get_coords6d(coord)
+
+    mask = torch.ones_like(dist).float()
+    mask[:rec_pos.size(0), rec_pos.size(0):] = 0.0
+    mask[rec_pos.size(0):, :rec_pos.size(0)] = 0.0
+    
+    num_dist_bins = 64
+    dist_bin = get_bins(dist, 3.25, 50.75, num_dist_bins)
+
+    def mask_mat(mat, num_bins):
+        mat = torch.where(mask.to(dtype=torch.bool), mat, num_bins - 1)
+        return mat
+
+    dist_bin = mask_mat(dist_bin, num_dist_bins)
+
+    # to onehot
+    dist = F.one_hot(dist_bin, num_classes=num_dist_bins).float()
+    
+    return dist
 
 def get_spatial_matrix(coord):
     dist, omega, theta, phi = get_coords6d(coord)
@@ -205,93 +229,8 @@ def get_cross_graph(x, e, sep, num_self, num_cross):
 
     return edge_index, edge_attr
 
-def get_cross_graph_index(x, sep, num_self, num_cross):
-    """cross graph from the complex pose"""
-
-    # distance matrix
-    d = torch.norm((x[:, None, :] - x[None, :, :]), dim=-1)
-
-    # make sure the knn not exceed the size
-    rec_len = sep
-    lig_len = x.size(0) - sep
-
-    # self and cross
-    num_self_lig = num_self
-    num_cross_lig = num_cross
-    num_self_rec = num_self
-    num_cross_rec = num_cross
-
-    if num_self_lig > lig_len:
-        num_self_lig = lig_len
-    if num_cross_lig > rec_len:
-        num_cross_lig = rec_len
-    if num_self_rec > rec_len:
-        num_self_rec = rec_len
-    if num_cross_rec > lig_len:
-        num_cross_rec = lig_len
-
-    # intra and inter topk
-    nbhd_ranking_ii, nbhd_indices_ii = d[..., :sep, :sep].topk(num_self_rec, dim=-1, largest=False)
-    nbhd_ranking_jj, nbhd_indices_jj = d[..., sep:, sep:].topk(num_self_lig, dim=-1, largest=False)
-    nbhd_ranking_ij, nbhd_indices_ij = d[..., :sep, sep:].topk(num_cross_rec, dim=-1, largest=False)
-    nbhd_ranking_ji, nbhd_indices_ji = d[..., sep:, :sep].topk(num_cross_lig, dim=-1, largest=False)
-
-    # edge src and dst
-    edge_src_rec = torch.arange(start=0, end=rec_len, device=x.device)[..., None].repeat(1, num_self_rec+num_cross_rec)
-    edge_src_lig = torch.arange(start=rec_len, end=rec_len+lig_len, device=x.device)[..., None].repeat(1, num_self_lig+num_cross_lig)
-    edge_dst_rec = torch.cat([nbhd_indices_ii, nbhd_indices_ij + rec_len], dim=1)
-    edge_dst_lig = torch.cat([nbhd_indices_ji, nbhd_indices_jj + rec_len], dim=1)
-    edge_src = torch.cat([edge_src_rec.reshape(-1), edge_src_lig.reshape(-1)])
-    edge_dst = torch.cat([edge_dst_rec.reshape(-1), edge_dst_lig.reshape(-1)])
-
-    # combine graphs
-    edge_index = [edge_src, edge_dst]
-
-    return edge_index
-
-
 #----------------------------------------------------------------------------
 # nn Modules
-
-class TimestepEmbedder(nn.Module):
-    """
-    Embeds scalar timesteps into vector representations.
-    """
-    def __init__(self, hidden_size, frequency_embedding_size=256):
-        super().__init__()
-        self.mlp = nn.Sequential(
-            nn.Linear(frequency_embedding_size, hidden_size, bias=True),
-            nn.SiLU(),
-            nn.Linear(hidden_size, hidden_size, bias=True),
-        )
-        self.frequency_embedding_size = frequency_embedding_size
-
-    @staticmethod
-    def timestep_embedding(t, dim, max_period=10000):
-        """
-        Create sinusoidal timestep embeddings.
-        :param t: a 1-D Tensor of N indices, one per batch element.
-                          These may be fractional.
-        :param dim: the dimension of the output.
-        :param max_period: controls the minimum frequency of the embeddings.
-        :return: an (N, D) Tensor of positional embeddings.
-        """
-        # https://github.com/openai/glide-text2im/blob/main/glide_text2im/nn.py
-        half = dim // 2
-        freqs = torch.exp(
-            -math.log(max_period) * torch.arange(start=0, end=half, dtype=torch.float32) / half
-        ).to(device=t.device)
-        args = t[:, None].float() * freqs[None]
-        embedding = torch.cat([torch.cos(args), torch.sin(args)], dim=-1)
-        if dim % 2:
-            embedding = torch.cat([embedding, torch.zeros_like(embedding[:, :1])], dim=-1)
-        return embedding
-
-    def forward(self, t):
-        t_freq = self.timestep_embedding(t, self.frequency_embedding_size)
-        t_emb = self.mlp(t_freq)
-        return t_emb
-
 
 class GaussianFourierProjection(nn.Module):
     """Gaussian random features for encoding time steps."""  
@@ -317,11 +256,10 @@ class EGNNLayer(nn.Module):
         normalize=False, 
         tanh=False, 
         update_coords=False,
-        coord_weights_clamp_value=None,
+        coord_weights_clamp_value=2.0,
         dropout=0.0,
     ):
         super(EGNNLayer, self).__init__()
-        self.update_coords = update_coords
         self.egcl = E_GCL(
             input_nf=node_dim, 
             output_nf=node_dim, 
@@ -338,12 +276,8 @@ class EGNNLayer(nn.Module):
         )
 
     def forward(self, h, x, edges, edge_attr=None, lig_mask=None):
-        if self.update_coords:
-            h, x, edge_attr, tr_update, rot_update = self.egcl(h, edges, x, edge_attr=edge_attr, lig_mask=lig_mask)
-            return h, x, edge_attr, tr_update, rot_update
-        else:
-            h, x, edge_attr = self.egcl(h, edges, x, edge_attr=edge_attr, lig_mask=lig_mask)
-            return h, x, edge_attr
+        h, x, edge_attr = self.egcl(h, edges, x, edge_attr=edge_attr, lig_mask=lig_mask)
+        return h, x, edge_attr
 
 
 class EGNN(nn.Module):
@@ -378,14 +312,44 @@ class EGNN(nn.Module):
 
     def forward(self, h, x, edges, edge_attr=None, lig_mask=None):
         for i in range(self.depth):
-            is_last = i == self.depth - 1
-            if not is_last:
-                h, x, edge_attr = self._modules["EGNN_%d" % i](h, x, edges, edge_attr=edge_attr, lig_mask=lig_mask)
-            else:
-                h, x, edge_attr, tr_update, rot_update = self._modules["EGNN_%d" % i](h, x, edges, edge_attr=edge_attr, lig_mask=lig_mask)
+            h, x, edge_attr = self._modules["EGNN_%d" % i](h, x, edges, edge_attr=edge_attr, lig_mask=lig_mask)
+        return h, x, edge_attr
 
-        return h, tr_update, rot_update
 
+class DistogramHead(nn.Module):
+    """
+    Computes a distogram probability distribution.
+
+    For use in computation of distogram loss, subsection 1.9.8
+    """
+
+    def __init__(self, c_z, no_bins, **kwargs):
+        """
+        Args:
+            c_z:
+                Input channel dimension
+            no_bins:
+                Number of distogram bins
+        """
+        super(DistogramHead, self).__init__()
+
+        self.c_z = c_z
+        self.no_bins = no_bins
+        self.linear = nn.Linear(self.c_z, self.no_bins)
+
+    def forward(self, z):  # [*, N, N, C_z]
+        """
+        Args:
+            z:
+                [*, N_res, N_res, C_z] pair embedding
+        Returns:
+            [*, N, N, no_bins] distogram probability distribution
+        """
+        # [*, N, N, no_bins]
+        logits = self.linear(z)
+        logits = logits + logits.transpose(-2, -3)
+        
+        return logits
 
 #----------------------------------------------------------------------------
 # Main score network
@@ -407,29 +371,49 @@ class Score_Net(nn.Module):
         decoder_depth = conf.decoder_depth
         dropout = conf.dropout
         normalize = conf.normalize
+        activation_checkpointing = conf.activation_checkpointing
         
         self.cut_off = conf.cut_off
+        self.num_recycles = conf.num_recycles
         
-        # single init embedding
-        self.single_embed = nn.Linear(lm_embed_dim, node_dim, bias=False)
+        # node init embedding
+        self.node_embed = nn.Linear(lm_embed_dim, node_dim, bias=False)
 
-        # pair init embedding
+        # edge init embedding
         self.i_embed = nn.Linear(node_dim, edge_dim, bias=False)
         self.j_embed = nn.Linear(node_dim, edge_dim, bias=False)
         self.positional_embed = nn.Linear(positional_embed_dim, edge_dim, bias=False)
-        self.edge_transition = nn.Sequential(
-            nn.LayerNorm(2 * edge_dim),
-            nn.Linear(2 * edge_dim, edge_dim, bias=False),
+
+        # recycle embedding
+        self.node_recycle = nn.Linear(node_dim, node_dim, bias=False)
+        self.edge_recycle = nn.Linear(edge_dim, edge_dim, bias=False)
+        self.node_norm = nn.LayerNorm(node_dim)
+        self.edge_norm = nn.LayerNorm(edge_dim)
+
+        # pair module
+        self.encoder = PairformerModule(
+            token_s=node_dim, 
+            token_z=edge_dim,
+            num_blocks=encoder_depth, 
+            activation_checkpointing=activation_checkpointing,
         )
 
-        # encoder
-        self.encoder = PairModule(
-            node_dim=node_dim,
-            edge_dim=edge_dim,
-            depth=encoder_depth,
+        # dist head
+        self.to_dist = DistogramHead(
+            c_z=edge_dim,
+            no_bins=64,
         )
 
-        # decoder
+        # interface residue head
+        self.to_ires = nn.Sequential(
+            nn.Linear(node_dim, 2*node_dim),
+            nn.SiLU(),
+            nn.Linear(2*node_dim, 2*node_dim),
+            nn.SiLU(),
+            nn.Linear(2*node_dim, 1),
+        )
+
+        # denoising score network
         self.decoder = EGNN(
             node_dim=node_dim, 
             edge_dim=edge_dim, 
@@ -450,24 +434,8 @@ class Score_Net(nn.Module):
             nn.Linear(node_dim, 1, bias=False),
         )
 
-        # interface residue head
-        self.to_ires = nn.Sequential(
-            nn.Linear(node_dim, 2*node_dim),
-            nn.SiLU(),
-            nn.Linear(2*node_dim, 2*node_dim),
-            nn.SiLU(),
-            nn.Linear(2*node_dim, 1),
-        )
-
         # timestep embedding
-        self.t_embed = TimestepEmbedder(inner_dim)
-        self.t_to_node = nn.Sequential(
-            nn.LayerNorm(inner_dim),
-            nn.Linear(inner_dim, node_dim),
-        )
-
-        # sigma embedding
-        self.sigma_embed = nn.Sequential(
+        self.t_embed = nn.Sequential(
             GaussianFourierProjection(embed_dim=inner_dim),
             nn.Linear(inner_dim, inner_dim, bias=False),
             nn.Sigmoid(),
@@ -493,65 +461,86 @@ class Score_Net(nn.Module):
             nn.Softplus()
         )
 
-        self.apply(self._init_weights)
-
-    def _init_weights(self, module):
-        if isinstance(module, nn.Linear):
-            module.weight.data.normal_(mean=0.0, std=0.02)
-            if module.bias is not None:
-                module.bias.data.zero_()
-        elif isinstance(module, nn.LayerNorm):
-            module.bias.data.zero_()
-            module.weight.data.fill_(1.0)
-        
     def forward(self, batch, predict=False, return_energy=False):
         # get inputs
         rec_x = batch["rec_x"] 
         lig_x = batch["lig_x"] 
         rec_pos = batch["rec_pos"] 
         lig_pos = batch["lig_pos"] 
-        position_matrix = batch["position_matrix"]
         t = batch["t"]
+        position_matrix = batch["position_matrix"]
 
         # move to center
-        center = lig_pos[..., 1, :].mean(dim=0)
-        rec_pos = rec_pos - center
-        lig_pos = lig_pos - center
-
-        # get the current complex pose
-        lig_pos.requires_grad_()
-        pos = torch.cat([rec_pos, lig_pos], dim=0)
+        #center = lig_pos[..., 1, :].mean(dim=0)
+        #rec_pos = rec_pos - center
+        #lig_pos = lig_pos - center
 
         # get ca distance matrix 
         D = torch.norm((rec_pos[:, None, 1, :] - lig_pos[None, :, 1, :]), dim=-1)
 
         # node feature embedding
         x = torch.cat([rec_x, lig_x], dim=0)
-        node = self.single_embed(x) # [n, c]
+        node_init = self.node_embed(x) # [n, c]
 
         # edge feature embedding
-        position_embed = self.positional_embed(position_matrix)
-        edge = self.i_embed(node[:, None, :]) + self.j_embed(node[None, :, :])
-        edge = edge + position_embed
+        edge_init = self.i_embed(node_init[:, None, :]) + self.j_embed(node_init[None, :, :])
+        edge_init = edge_init + self.positional_embed(position_matrix)
 
-        # encoder
-        node, edge = self.encoder(node, edge)
+        # unsqueeze batch dim
+        node_init = node_init.unsqueeze(0)
+        edge_init = edge_init.unsqueeze(0)
+        mask = torch.ones(node_init.shape[:-1], dtype=torch.float32, device=node_init.device)
+        pair_mask = torch.ones(edge_init.shape[:-1], dtype=torch.float32, device=edge_init.device)
 
-        # node transition
-        t_emb = self.t_embed(t)
-        node = node + self.t_to_node(t_emb.repeat(node.size(0), 1))
+        # recycle
+        if self.training:
+            num_recycles = random.randint(0, self.num_recycles)
+        else:
+            num_recycles = self.num_recycles
         
-        # edge_transition
-        edge = self.edge_transition(torch.cat([edge, position_embed], dim=-1))
+        node = torch.zeros_like(node_init)
+        edge = torch.zeros_like(edge_init)
 
-        # sample edge_index and get edge_attr
-        edge_index, edge_attr = get_cross_graph(pos[..., 1, :], edge, sep=rec_x.size(0), num_self=20, num_cross=40)
+        for i in range(num_recycles + 1):
+            with torch.set_grad_enabled(self.training and (i == num_recycles)):
+                # Fixes an issue with unused parameters in autocast
+                if (
+                    self.training
+                    and (i == num_recycles)
+                    and torch.is_autocast_enabled()
+                ):
+                    torch.clear_autocast_cache()
 
-        # decoder
-        node_out, tr_update, rot_update = self.decoder(node, pos[..., 1, :], edge_index, edge_attr) # [R+L, H]
+                # Apply recycling
+                node = node_init + self.node_recycle(self.node_norm(node))
+                edge = edge_init + self.edge_recycle(self.edge_norm(edge)) 
+
+                # encoder
+                node, edge = self.encoder(node, edge, mask, pair_mask)
+
+        # squeeze batch dim
+        node = node.squeeze(0)
+        edge = edge.squeeze(0)
 
         # interface residue
-        ires = self.to_ires(node_out)
+        ires = self.to_ires(node)
+
+        # distogram
+        dist = self.to_dist(edge)
+
+        # get the current complex pose
+        lig_pos.requires_grad_()
+        pos = torch.cat([rec_pos, lig_pos], dim=0)
+
+        # sample edge_index and get edge_attr
+        edge_index, edge_attr = get_knn_and_sample_graph(pos[..., 1, :], edge)
+
+        # get ligand mask
+        lig_mask = torch.zeros(x.size(0), device=x.device)
+        lig_mask[rec_x.size(0):] = 1.0
+
+        # decoder
+        node_out, pos_out, _ = self.decoder(node, pos[..., 1, :], edge_index, edge_attr, lig_mask) # [R+L, H]
 
         # energy
         h_rec = repeat(node_out[:rec_pos.size(0)], 'n h -> n m h', m=lig_pos.size(0))
@@ -564,23 +553,22 @@ class Score_Net(nn.Module):
             return energy
 
         # force
-        tr_f = tr_update[rec_pos.size(0):]
-        rot_f = rot_update[rec_pos.size(0):]
-        f = tr_f + rot_f
+        lig_pos_curr = pos_out[rec_pos.size(0):] 
+        r = lig_pos[..., 1, :].detach()
+        f = lig_pos_curr - r # f / kT
 
         # translation
-        tr_score = tr_f.mean(dim=0, keepdim=True)
+        tr_pred = f.mean(dim=0, keepdim=True)
 
         # rotation
-        r = lig_pos[..., 1, :].detach()
-        rot_score = torch.cross(r, rot_f, dim=-1).mean(dim=0, keepdim=True)
+        rot_pred = torch.cross(r - r.mean(dim=0), f, dim=-1).mean(dim=0, keepdim=True)
 
         # scale
-        sigma = self.sigma_embed(t)
-        tr_norm = torch.linalg.vector_norm(tr_score, keepdim=True)
-        tr_score = tr_score / (tr_norm + 1e-6) * self.tr_scale(torch.cat([tr_norm, sigma], dim=-1))
-        rot_norm = torch.linalg.vector_norm(rot_score, keepdim=True)
-        rot_score = rot_score / (rot_norm + 1e-6) * self.rot_scale(torch.cat([rot_norm, sigma], dim=-1))
+        t = self.t_embed(t)
+        tr_norm = torch.linalg.vector_norm(tr_pred, keepdim=True)
+        tr_score = tr_pred / (tr_norm + 1e-6) * self.tr_scale(torch.cat([tr_norm, t], dim=-1))
+        rot_norm = torch.linalg.vector_norm(rot_pred, keepdim=True)
+        rot_score = rot_pred / (rot_norm + 1e-6) * self.rot_scale(torch.cat([rot_norm, t], dim=-1))
 
         if predict:
             num_clashes = get_clashes(D)
@@ -590,6 +578,7 @@ class Score_Net(nn.Module):
                 "rot_score": rot_score,
                 "energy": energy,
                 "f": f,
+                "dist": dist,
                 "num_clashes": num_clashes,
                 "ires": ires,
             }
@@ -615,11 +604,137 @@ class Score_Net(nn.Module):
             "energy": energy,
             "f": f,
             "dedx": dedx,
+            "dist": dist,
             "ires": ires,
         }
 
         return outputs
     
+    def encode(self, batch):
+        # get inputs
+        rec_x = batch["rec_x"] 
+        lig_x = batch["lig_x"] 
+        position_matrix = batch["position_matrix"]
+
+        # node feature embedding
+        x = torch.cat([rec_x, lig_x], dim=0)
+        node_init = self.node_embed(x) # [n, c]
+
+        # edge feature embedding
+        edge_init = self.i_embed(node_init[:, None, :]) + self.j_embed(node_init[None, :, :])
+        edge_init = edge_init + self.positional_embed(position_matrix)
+
+        # unsqueeze batch dim
+        node_init = node_init.unsqueeze(0)
+        edge_init = edge_init.unsqueeze(0)
+        mask = torch.ones(node_init.shape[:-1], dtype=torch.float32, device=node_init.device)
+        pair_mask = torch.ones(edge_init.shape[:-1], dtype=torch.float32, device=edge_init.device)
+
+        # recycle
+        if self.training:
+            num_recycles = random.randint(0, self.num_recycles)
+        else:
+            num_recycles = self.num_recycles
+        
+        node = torch.zeros_like(node_init)
+        edge = torch.zeros_like(edge_init)
+
+        for i in range(num_recycles + 1):
+            with torch.set_grad_enabled(self.training and (i == num_recycles)):
+                # Fixes an issue with unused parameters in autocast
+                if (
+                    self.training
+                    and (i == num_recycles)
+                    and torch.is_autocast_enabled()
+                ):
+                    torch.clear_autocast_cache()
+
+                # Apply recycling
+                node = node_init + self.node_recycle(self.node_norm(node))
+                edge = edge_init + self.edge_recycle(self.edge_norm(edge)) 
+
+                # encoder
+                node, edge = self.encoder(node, edge, mask, pair_mask)
+
+        # squeeze batch dim
+        node = node.squeeze(0)
+        edge = edge.squeeze(0)
+
+        return node, edge
+
+    def decode(self, batch):
+        # get inputs
+        node = batch["node"] 
+        edge = batch["edge"] 
+        rec_pos = batch["rec_pos"] 
+        lig_pos = batch["lig_pos"] 
+        t = batch["t"]
+
+        # move to center
+        #center = lig_pos[..., 1, :].mean(dim=0)
+        #rec_pos = rec_pos - center
+        #lig_pos = lig_pos - center
+
+        # get the current complex pose
+        pos = torch.cat([rec_pos, lig_pos], dim=0)
+
+        # get ca distance matrix 
+        D = torch.norm((rec_pos[:, None, 1, :] - lig_pos[None, :, 1, :]), dim=-1)
+        num_clashes = get_clashes(D)
+
+        # interface residue
+        ires = self.to_ires(node)
+
+        # distogram
+        dist = self.to_dist(edge)
+
+        # sample edge_index and get edge_attr
+        edge_index, edge_attr = get_knn_and_sample_graph(pos[..., 1, :], edge)
+
+        # get ligand mask
+        lig_mask = torch.zeros(pos.size(0), device=pos.device)
+        lig_mask[rec_pos.size(0):] = 1.0
+
+        # decoder
+        node_out, pos_out, _ = self.decoder(node, pos[..., 1, :], edge_index, edge_attr, lig_mask) # [R+L, H]
+
+        # energy
+        h_rec = repeat(node_out[:rec_pos.size(0)], 'n h -> n m h', m=lig_pos.size(0))
+        h_lig = repeat(node_out[rec_pos.size(0):], 'm h -> n m h', n=rec_pos.size(0))
+        energy = self.to_energy(torch.cat([h_rec, h_lig], dim=-1)).squeeze(-1) # [R, L]
+        mask_2D = (D < self.cut_off).float() # [R, L]
+        energy = (energy * mask_2D).sum() / (mask_2D.sum() + 1e-6) 
+
+        # force
+        lig_pos_curr = pos_out[rec_pos.size(0):] 
+        r = lig_pos[..., 1, :].detach()
+        f = lig_pos_curr - r # f / kT
+
+        # translation
+        tr_pred = f.mean(dim=0, keepdim=True)
+
+        # rotation
+        rot_pred = torch.cross(r - r.mean(dim=0), f, dim=-1).mean(dim=0, keepdim=True)
+
+        # scale
+        t = self.t_embed(t)
+        tr_norm = torch.linalg.vector_norm(tr_pred, keepdim=True)
+        tr_score = tr_pred / (tr_norm + 1e-6) * self.tr_scale(torch.cat([tr_norm, t], dim=-1))
+        rot_norm = torch.linalg.vector_norm(rot_pred, keepdim=True)
+        rot_score = rot_pred / (rot_norm + 1e-6) * self.rot_scale(torch.cat([rot_norm, t], dim=-1))
+
+        outputs = {
+            "tr_score": tr_score,
+            "rot_score": rot_score,
+            "energy": energy,
+            "f": f,
+            "dist": dist,
+            "num_clashes": num_clashes,
+            "ires": ires,
+        }
+
+        return outputs
+
 #----------------------------------------------------------------------------
 # Testing
 
@@ -627,13 +742,13 @@ if __name__ == '__main__':
     conf = ModelConfig(
         lm_embed_dim=1280,
         positional_embed_dim=68,
-        spatial_embed_dim=100,
-        contact_embed_dim=1,
+        spatial_embed_dim=64,
         node_dim=256,
         edge_dim=128,
         inner_dim=128,
         encoder_depth=2,
         decoder_depth=2,
+        num_recycles=3,
     )
 
     model = Score_Net(conf)
@@ -643,7 +758,6 @@ if __name__ == '__main__':
     rec_pos = torch.randn(40, 3, 3)
     lig_pos = torch.randn(5, 3, 3)
     t = torch.tensor([0.5])
-    contact_matrix = torch.zeros(45, 45)
     position_matrix = torch.zeros(45, 45, 68)
 
     batch = {
@@ -652,7 +766,6 @@ if __name__ == '__main__':
         "rec_pos": rec_pos,
         "lig_pos": lig_pos,
         "t": t,
-        "contact_matrix": contact_matrix,
         "position_matrix": position_matrix,
     }
 

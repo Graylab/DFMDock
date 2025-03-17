@@ -443,15 +443,15 @@ class Score_Net(nn.Module):
         tr_pred = force.sum(dim=0, keepdim=True)
         tr_norm = torch.linalg.vector_norm(tr_pred, keepdim=True)
         tr_scale = self.tr_scale(torch.cat([tr_norm, t], dim=-1))
-        tr_score = tr_pred * tr_scale
-        force = force * tr_scale
+        tr_score = tr_pred * tr_scale / (tr_norm + 1e-6)
+        force = force * tr_scale / (tr_norm + 1e-6) 
 
         # rotation
         rot_pred = torque.sum(dim=0, keepdim=True)
         rot_norm = torch.linalg.vector_norm(rot_pred, keepdim=True)
         rot_scale = self.rot_scale(torch.cat([rot_norm, t], dim=-1))
-        rot_score = rot_pred * rot_scale
-        torque = torque * rot_scale
+        rot_score = rot_pred * rot_scale / (rot_norm + 1e-6)
+        torque = torque * rot_scale / (rot_norm + 1e-6)
 
         if predict:
             num_clashes = get_clashes(d_ij)

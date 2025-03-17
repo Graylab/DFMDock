@@ -27,6 +27,7 @@ class Score_Model(pl.LightningModule):
         experiment,
     ):
         super().__init__()
+        #self.automatic_optimization = False
         self.save_hyperparameters()
         self.lr = experiment.lr
         self.weight_decay = experiment.weight_decay
@@ -106,6 +107,10 @@ class Score_Model(pl.LightningModule):
             f = outputs["f"]
             dedx = outputs["dedx"]
             energy_noised = outputs["energy"]
+
+            print(f.norm())
+            print(dedx.norm())
+            print(energy_noised)
 
             # energy conservation loss
             if self.separate_energy_loss:
@@ -224,6 +229,26 @@ class Score_Model(pl.LightningModule):
     
     def training_step(self, batch, batch_idx):
         losses = self.step(batch, batch_idx)
+
+        # debug
+        """
+        optimizer = self.optimizers()
+
+        loss = losses["loss"]
+        optimizer.zero_grad()
+        self.manual_backward(loss)
+
+        # Print gradients
+        for name, param in self.named_parameters():
+            if param.grad is not None:
+                print(f"{name} grad norm: {param.grad.norm()}")
+            else:
+                print(f"{name} has NO gradient!")
+         
+        optimizer.step()  # Update weights
+        """
+
+
         for loss_name, indiv_loss in losses.items():
             self.log(
                 f"train/{loss_name}", 
@@ -297,6 +322,7 @@ def main(conf: DictConfig):
         experiment=conf.experiment
     )
     trainer = pl.Trainer(accelerator='cpu', devices=1, max_epochs=10, inference_mode=False)
+    trainer.fit(model, dataloader)
     trainer.validate(model, dataloader)
 
 if __name__ == '__main__':

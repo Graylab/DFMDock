@@ -13,7 +13,7 @@ from dataclasses import dataclass
 from tqdm import tqdm
 from torch.utils import data
 from scipy.spatial.transform import Rotation 
-from dfmdock.models.score_model_pair import Score_Model
+from dfmdock.models.score_model_base_pair import Score_Model
 from dfmdock.datasets.ppi_mlsb_dataset import PPIDataset
 from dfmdock.utils.geometry import axis_angle_to_matrix, matrix_to_axis_angle
 from dfmdock.utils.pdb import save_PDB, place_fourth_atom 
@@ -216,8 +216,8 @@ class Sampler:
             batch = {
                 "rec_x": rec_x,
                 "lig_x": lig_x,
-                "rec_pos": rec_pos.clone().detach(),
-                "lig_pos": lig_pos.clone().detach(),
+                "rec_pos": rec_pos.detach().clone(),
+                "lig_pos": lig_pos.detach().clone(),
                 "position_matrix": position_matrix,
             }
 
@@ -314,8 +314,8 @@ class Sampler:
                 t = torch.ones(batch_size, device=self.device) * time_step
 
                 batch["t"] = t
-                batch["rec_pos"] = rec_pos.clone().detach()
-                batch["lig_pos"] = lig_pos.clone().detach()
+                batch["rec_pos"] = rec_pos.detach().clone()
+                batch["lig_pos"] = lig_pos.detach().clone()
 
                 # get predictions
                 output = self.model.decode(batch) 
@@ -353,15 +353,13 @@ class Sampler:
 
                 # clash
                 if self.data_conf.use_clash_force:
-                    clash_force = self.clash_force(rec_pos.clone().detach(), lig_pos.clone().detach())
+                    clash_force = self.clash_force(rec_pos.detach().clone(), lig_pos.detach().clone())
                     lig_pos = lig_pos + clash_force
-
-                """
+                
                 if is_last:
-                    batch["rec_pos"] = rec_pos.clone().detach()
-                    batch["lig_pos"] = lig_pos.clone().detach()
+                    batch["rec_pos"] = rec_pos.detach().clone()
+                    batch["lig_pos"] = lig_pos.detach().clone()
                     output = self.model.decode(batch) 
-                """
 
                 # save coordinates
                 rec_trj.append(rec_pos)         

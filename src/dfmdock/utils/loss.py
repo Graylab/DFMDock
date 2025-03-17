@@ -40,7 +40,23 @@ def compute_tm(
 
     return max_sum
 
-def get_tm_loss(
+def compute_pde(
+    logits: torch.Tensor,
+    max_bin: int = 31,
+    no_bins: int = 64,
+    eps: float = 1e-8,
+) -> torch.Tensor:
+    boundaries = torch.linspace(
+        0, max_bin, steps=(no_bins - 1), device=logits.device
+    )
+
+    bin_centers = _calculate_bin_centers(boundaries)
+    probs = torch.nn.functional.softmax(logits, dim=-1)
+    pde = torch.sum(probs * bin_centers, dim=-1)
+
+    return pde.mean()
+
+def predicted_error_loss(
     logits,
     sq_diff,
     max_bin=31,
