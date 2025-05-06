@@ -1,3 +1,4 @@
+import io
 import os
 import csv
 import h5py
@@ -18,14 +19,13 @@ from torch.utils.data import DataLoader, Dataset, Subset, DistributedSampler
 from scipy.spatial.transform import Rotation 
 from dfmdock.utils import residue_constants
 from pinder.core.index.utils import get_index
+from openfold.np.protein import from_pdb_string, to_pdb, Protein
+from openfold.np.residue_constants import aatype_to_str_sequence
+from openfold.utils.all_atom_multimer import atom37_to_atom14, atom14_to_atom37
+
 
 #----------------------------------------------------------------------------
 # Helper functions
-
-def load_dict_data(file_path):
-    with gzip.open(file_path, 'rb') as f:
-        dict_data = pickle.load(f)
-    return dict_data
 
 def get_interface_residues(coords, asym_id, interface_threshold=10.0):
     coord_diff = coords[..., None, :, :] - coords[..., None, :, :, :]
@@ -112,6 +112,26 @@ def randint(lower, upper):
         (1,),
     )[0])
 
+def get_interface_residue_tensors(set1, set2, threshold=8.0):
+    n1_len = set1.shape[0]
+    n2_len = set2.shape[0]
+    
+    # Calculate the Euclidean distance between each pair of points from the two sets
+    dists = torch.cdist(set1, set2)
+
+    # Find the indices where the distance is less than the threshold
+    close_points = dists < threshold
+
+    # Create indicator tensors initialized to 0
+    indicator_set1 = torch.zeros((n1_len, 1), dtype=torch.float32)
+    indicator_set2 = torch.zeros((n2_len, 1), dtype=torch.float32)
+
+    # Set the corresponding indices to 1 where the points are close
+    indicator_set1[torch.any(close_points, dim=1)] = 1.0
+    indicator_set2[torch.any(close_points, dim=0)] = 1.0
+
+    return indicator_set1, indicator_set2
+
 def one_hot(x, v_bins):
     reshaped_bins = v_bins.view(((1,) * len(x.shape)) + (len(v_bins),))
     diffs = x[..., None] - reshaped_bins
@@ -169,26 +189,6 @@ def random_rotation(rec_pos, lig_pos):
     lig_pos_out = pos[rec_pos.size(0):]
     return rec_pos_out, lig_pos_out
 
-def get_interface_residue_tensors(set1, set2, threshold=8.0):
-    n1_len = set1.shape[0]
-    n2_len = set2.shape[0]
-    
-    # Calculate the Euclidean distance between each pair of points from the two sets
-    dists = torch.cdist(set1, set2)
-
-    # Find the indices where the distance is less than the threshold
-    close_points = dists < threshold
-
-    # Create indicator tensors initialized to 0
-    indicator_set1 = torch.zeros((n1_len, 1), dtype=torch.float32)
-    indicator_set2 = torch.zeros((n2_len, 1), dtype=torch.float32)
-
-    # Set the corresponding indices to 1 where the points are close
-    indicator_set1[torch.any(close_points, dim=1)] = 1.0
-    indicator_set2[torch.any(close_points, dim=0)] = 1.0
-
-    return indicator_set1, indicator_set2
-
 #----------------------------------------------------------------------------
 # Dataset class
 
@@ -197,89 +197,57 @@ class PPIDataset(Dataset):
         self, 
         dataset: str,
         training: bool = True,
-        crop_size: int = 1200,
+        crop_size = 1200,
     ):
         self.dataset = dataset 
         self.training = training
         self.crop_size = crop_size
 
         # Training sets
-        if dataset == 'dips_train':
+        if dataset == 'dips_train_hetero':
             self.data_dir = "/scratch4/jgray21/lchu11/data/dips/pt_clean"
-            self.data_list = "/scratch4/jgray21/lchu11/data/dips/data_list/diffdock-pp/train.txt" 
-
-        elif dataset == 'dips_val':
-            self.data_dir = "/scratch4/jgray21/lchu11/data/dips/pt_clean"
-            self.data_list = "/scratch4/jgray21/lchu11/data/dips/data_list/diffdock-pp/val.txt" 
-
-        elif dataset == 'dips_train_val':
-            self.data_dir = "/scratch4/jgray21/lchu11/data/dips/pt_clean"
-            self.data_list = "/scratch4/jgray21/lchu11/data/dips/data_list/diffdock-pp/train_val.txt" 
-
-        elif dataset == 'dips_train_hetero':
-            self.data_dir = "/scratch4/jgray21/lchu11/data/dips/pt_clean"
+            self.boltz_dir = "/scratch4/jgray21/lchu11/data/dips/boltz_files/boltz_pt_files"
             self.data_list = "/scratch4/jgray21/lchu11/data/dips/data_list/diffdock-pp/dips_train_hetero.txt" 
 
         elif dataset == 'dips_val_hetero':
             self.data_dir = "/scratch4/jgray21/lchu11/data/dips/pt_clean"
+            self.boltz_dir = "/scratch4/jgray21/lchu11/data/dips/boltz_files/boltz_pt_files"
             self.data_list = "/scratch4/jgray21/lchu11/data/dips/data_list/diffdock-pp/dips_val_hetero.txt" 
 
-        elif dataset == 'dips_single':
-            self.data_dir = "/scratch4/jgray21/lchu11/data/dips/pt_clean"
-            self.data_list = "/scratch4/jgray21/lchu11/data/dips/data_list/diffdock-pp/dips_single.txt" 
-
-        elif dataset == 'pinder_train':
-            self.data_dir = "/scratch4/jgray21/lchu11/data/pinder/train"
-            self.file_list = [f.name.split('.')[0] for f in Path(self.data_dir).iterdir()]
-
-        elif dataset == 'pinder_val':
-            self.data_dir = "/scratch4/jgray21/lchu11/data/pinder/val"
-            self.file_list = [f.name.split('.')[0] for f in Path(self.data_dir).iterdir()]
-
-        elif dataset == 'pinder_train_sub':
-            self.data_dir = "/scratch4/jgray21/lchu11/data/pinder/train"
-            with open("/scratch4/jgray21/lchu11/graylab_repos/DFMDock/src/dfmdock/data/pinder_train/pinder_train_sub.txt", 'r') as f:
-                lines = f.readlines()
-            self.file_list = [line.strip() for line in lines] 
-
-        elif dataset == 'ppi3d_train':
-            self.data_dir = "/scratch4/jgray21/lchu11/data/ppi3d/gz_files"
-            self.data_list = "/scratch4/jgray21/lchu11/data/ppi3d/train.txt"
-
-        elif dataset == 'ppi3d_val':
-            self.data_dir = "/scratch4/jgray21/lchu11/data/ppi3d/gz_files"
-            self.data_list = "/scratch4/jgray21/lchu11/data/ppi3d/val.txt"
-
         # Testing sets
-        elif dataset == 'dips_test':
-            self.data_dir = "/scratch4/jgray21/lchu11/data/pt/dips_test"
-            self.data_list = "/scratch4/jgray21/lchu11/data/dips/data_list/geodock/test.txt" 
-
         elif dataset == 'db5_test':
             self.data_dir = "/scratch4/jgray21/lchu11/data/pt/db5_bound"
+            self.boltz_dir = "/scratch4/jgray21/lchu11/data/db5/boltz_files/boltz_pt_files"
+            self.data_list = "/scratch4/jgray21/lchu11/data/db5/test_bound.txt"
+
+        elif dataset == 'db5_msa_test':
+            self.data_dir = "/scratch4/jgray21/lchu11/data/pt/db5_bound"
+            self.boltz_dir = "/scratch4/jgray21/lchu11/data/db5/boltz_files/boltz_msa_pt_files"
             self.data_list = "/scratch4/jgray21/lchu11/data/db5/test_bound.txt"
             
-        elif dataset == 'db5_all':
+        elif dataset == 'db5_bound':
             self.data_dir = "/scratch4/jgray21/lchu11/data/pt/db5_bound"
+            self.boltz_dir = "/scratch4/jgray21/lchu11/data/db5/boltz_files/boltz_pt_files"
+            self.data_list = "/scratch4/jgray21/lchu11/data/db5/test.txt"
+
+        elif dataset == 'db5_msa_bound':
+            self.data_dir = "/scratch4/jgray21/lchu11/data/pt/db5_bound"
+            self.boltz_dir = "/scratch4/jgray21/lchu11/data/db5/boltz_files/boltz_msa_pt_files"
             self.data_list = "/scratch4/jgray21/lchu11/data/db5/test.txt"
 
         elif dataset == 'db5_ab_ag':
             self.data_dir = "/scratch4/jgray21/lchu11/data/pt/db5_bound"
+            self.boltz_dir = "/scratch4/jgray21/lchu11/data/db5/boltz_files/boltz_pt_files"
             self.data_list = "/scratch4/jgray21/lchu11/data/db5/ab_ag.txt"
 
-        elif dataset == 'af_ab_ag':
-            self.data_dir = "/scratch4/jgray21/lchu11/data/pt/ab_ag"
-            self.data_list = "/scratch4/jgray21/lchu11/data/ab_ag/Yin/af2.3_benchmark/test.txt"
-        
-        elif dataset == 'pinder_s':
-            pindex = get_index()
-            self.data_dir = "/scratch4/jgray21/lchu11/data/pinder/test" 
-            self.file_list = list(pindex.query('pinder_s == True').id)
-        
-        if self.dataset[:6] != 'pinder':
-            with open(self.data_list, 'r') as f:
-                lines = f.readlines()
-            self.file_list = [line.strip() for line in lines] 
+        elif dataset == 'db5_msa_ab_ag':
+            self.data_dir = "/scratch4/jgray21/lchu11/data/pt/db5_bound"
+            self.boltz_dir = "/scratch4/jgray21/lchu11/data/db5/boltz_files/boltz_msa_pt_files"
+            self.data_list = "/scratch4/jgray21/lchu11/data/db5/ab_ag.txt"
+
+        with open(self.data_list, 'r') as f:
+            lines = f.readlines()
+        self.file_list = [line.strip() for line in lines] 
 
     def __getitem__(self, idx: int):
         # Get info from file_list 
@@ -287,84 +255,57 @@ class PPIDataset(Dataset):
             _id = self.file_list[idx]
             split_string = _id.split('/')
             _id = split_string[0] + '_' + split_string[1].rsplit('.', 1)[0]
-            data = torch.load(os.path.join(self.data_dir, _id+'.pt'))
-            rec_seq = data['receptor'].seq
-            rec_pos = data['receptor'].pos.float()
-            lig_seq = data['ligand'].seq
-            lig_pos = data['ligand'].pos.float()
-
-        elif self.dataset[:6] == 'pinder':
-            data = load_dict_data(os.path.join(self.data_dir, f'{self.file_list[idx]}.pkl.gz'))
-            _id = data['id']
-            rec_seq = data['rec_seq']
-            lig_seq = data['lig_seq']
-            rec_pos = torch.from_numpy(data['rec_pos']).float()
-            lig_pos = torch.from_numpy(data['lig_pos']).float()
-        
-        elif self.dataset[:5] == 'ppi3d':
-            data_path = os.path.join(self.data_dir, f'{self.file_list[idx]}.pth.gz')
-            with gzip.open(data_path, "rb") as f:
-                data = torch.load(f)
-            _id = data['id']
-            rec_seq = data['rec_seq']
-            lig_seq = data['lig_seq']
-            rec_pos = data['rec_pos'][..., :3, :]
-            lig_pos = data['lig_pos'][..., :3, :]
-            
-        else:
+        elif self.dataset[:3] == 'db5':
             _id = self.file_list[idx]
-            data = torch.load(os.path.join(self.data_dir, _id+'.pt'))
-            rec_seq = data['receptor'].seq
-            rec_pos = data['receptor'].pos.float()
-            lig_seq = data['ligand'].seq
-            lig_pos = data['ligand'].pos.float()
-        
+
+        # load boltz
+        with gzip.open(f"{self.boltz_dir}/{_id}.pt.gz", "rb") as f:
+            buffer = io.BytesIO(f.read())
+            boltz_features = torch.load(buffer)
+
+        # load structure
+        data = torch.load(os.path.join(self.data_dir, _id+'.pt'))
+
+        s = boltz_features["s"]
+        z = boltz_features["z"]
+        rec_esm = data['receptor'].x.float()
+        rec_seq = data['receptor'].seq
+        rec_pos = data['receptor'].pos.float()
+        lig_esm = data['ligand'].x.float()
+        lig_seq = data['ligand'].seq
+        lig_pos = data['ligand'].pos.float()
+
         # One-Hot embeddings
-        rec_x = torch.from_numpy(residue_constants.sequence_to_onehot(
+        rec_onehot = torch.from_numpy(residue_constants.sequence_to_onehot(
             sequence=rec_seq,
             mapping=residue_constants.restype_order_with_x,
             map_unknown_to_x=True,
         )).float()
 
-        lig_x = torch.from_numpy(residue_constants.sequence_to_onehot(
+        lig_onehot = torch.from_numpy(residue_constants.sequence_to_onehot(
             sequence=lig_seq,
             mapping=residue_constants.restype_order_with_x,
             map_unknown_to_x=True,
         )).float()
 
-        # Shuffle and Crop for training
+        rec_x = torch.cat([rec_esm, rec_onehot], dim=-1)
+        lig_x = torch.cat([lig_esm, lig_onehot], dim=-1)
+
         if self.training:
-            # Shuffle the order of rec and lig
-            vars_list = [(rec_x, rec_seq, rec_pos), (lig_x, lig_seq, lig_pos)]
-            random.shuffle(vars_list)
-            rec_x, rec_seq, rec_pos = vars_list[0]
-            lig_x, lig_seq, lig_pos = vars_list[1]
-
             # Crop to crop_size
-            rec_x, lig_x, rec_pos, lig_pos, res_id, asym_id= self.crop_to_size(rec_x, lig_x, rec_seq, lig_seq, rec_pos, lig_pos)  
+            s, z, rec_x, lig_x, rec_pos, lig_pos, res_id, asym_id= self.crop_to_size(s, z, rec_x, lig_x, rec_seq, lig_seq, rec_pos, lig_pos)  
         else:
-            # make the smaller one ligand
-            vars_list = [(rec_x, rec_seq, rec_pos), (lig_x, lig_seq, lig_pos)]
-            if len(rec_x) < len(lig_x):
-                rec_x, rec_seq, rec_pos = vars_list[1]
-                lig_x, lig_seq, lig_pos = vars_list[0]
-
             # get res_id and asym_id
             n = rec_x.size(0) + lig_x.size(0)
             res_id = torch.arange(n).long()
             asym_id = torch.zeros(n).long()
             asym_id[rec_x.size(0):] = 1
-
+        
         # Positional embeddings
         position_matrix = relpos(res_id, asym_id)
 
         # Random rotation augmentation
         rec_pos, lig_pos = random_rotation(rec_pos, lig_pos)
-
-        # move lig center to origin
-        center = lig_pos[..., 1, :].mean(dim=0)
-        rec_pos -= center
-        lig_pos -= center
 
         # Interface residues
         rec_ires, lig_ires = get_interface_residue_tensors(rec_pos[..., 1, :], lig_pos[..., 1, :])
@@ -381,6 +322,8 @@ class PPIDataset(Dataset):
             'lig_pos': lig_pos,
             'ires': ires,
             'position_matrix': position_matrix,
+            's': s,
+            'z': z,
         }
         
         return {key: value for key, value in output.items()}
@@ -388,7 +331,7 @@ class PPIDataset(Dataset):
     def __len__(self):
         return len(self.file_list)
 
-    def crop_to_size(self, rec_x, lig_x, rec_seq, lig_seq, rec_pos, lig_pos):
+    def crop_to_size(self, s, z, rec_x, lig_x, rec_seq, lig_seq, rec_pos, lig_pos):
         n = rec_x.size(0) + lig_x.size(0)
         res_id = torch.arange(n).long()
         asym_id = torch.zeros(n).long()
@@ -397,7 +340,7 @@ class PPIDataset(Dataset):
         x = torch.cat([rec_x, lig_x], dim=0)
         pos = torch.cat([rec_pos, lig_pos], dim=0)
 
-        use_spatial_crop = random.random() < 0.5
+        use_spatial_crop = True
         num_res = asym_id.size(0)
 
         if num_res <= self.crop_size:
@@ -411,6 +354,9 @@ class PPIDataset(Dataset):
         asym_id = torch.index_select(asym_id, 0, crop_idxs)
         x = torch.index_select(x, 0, crop_idxs)
         pos = torch.index_select(pos, 0, crop_idxs)
+        s = torch.index_select(s, 0, crop_idxs)
+        z = torch.index_select(z, 0, crop_idxs)
+        z = torch.index_select(z, 1, crop_idxs)
 
         sep = asym_id.tolist().index(1)
         rec_x = x[:sep]
@@ -418,8 +364,7 @@ class PPIDataset(Dataset):
         rec_pos = pos[:sep]
         lig_pos = pos[sep:]
 
-        return rec_x, lig_x, rec_pos, lig_pos, res_id, asym_id
-        
+        return s, z, rec_x, lig_x, rec_pos, lig_pos, res_id, asym_id
 #----------------------------------------------------------------------------
 # DataModule class
 
@@ -428,15 +373,15 @@ class PPIDataModule(pl.LightningDataModule):
         self,
         train_dataset: str = "data/",
         val_dataset: str = "data/",
-        crop_size: int = 1200,
         batch_size: int = 1,
+        crop_size: int = 1200,
         **kwargs
     ):
         super().__init__()
         self.train_dataset = train_dataset
         self.val_dataset = val_dataset
-        self.crop_size = crop_size
         self.batch_size = batch_size
+        self.crop_size = crop_size
         self.num_workers = kwargs['num_workers']
         self.pin_memory = kwargs['pin_memory']
 
@@ -448,7 +393,7 @@ class PPIDataModule(pl.LightningDataModule):
 
     def setup(self, stage: Optional[str] = None):
         self.data_train = PPIDataset(
-            dataset=self.train_dataset, 
+            dataset=self.train_dataset,
             crop_size=self.crop_size,
         )
         self.data_val = PPIDataset(
@@ -481,7 +426,7 @@ class PPIDataModule(pl.LightningDataModule):
 
 if __name__ == '__main__':
     dataset = PPIDataset(
-        dataset="dips_train_hetero",
+        dataset="db5_msa_ab_ag",
     )
     print(len(dataset))
     print(dataset[0])

@@ -6,17 +6,15 @@ import torch.nn.functional as F
 import pytorch_lightning as pl
 import numpy as np
 import random
+import importlib
 from torch.utils import data
 from torch_geometric.loader import DataLoader
 from scipy.spatial.transform import Rotation
 from omegaconf import DictConfig
-from dfmdock.models.score_net_confidence import Score_Net
 from dfmdock.utils.so3_diffuser import SO3Diffuser 
 from dfmdock.utils.r3_diffuser import R3Diffuser 
 from dfmdock.utils.geometry import axis_angle_to_matrix, matrix_to_axis_angle
-from dfmdock.utils.coords6d import get_coords6d
-from dfmdock.utils.dockq import get_DockQ
-from dfmdock.datasets.pp_docking_dataset import PPDockingDataset
+from dfmdock.datasets.ppi_mlsb_dataset import PPIDataset
 
 #----------------------------------------------------------------------------
 # Main wrapper for training the model
@@ -55,11 +53,8 @@ class Score_Model(pl.LightningModule):
         # interface 
         self.use_interface_loss = experiment.use_interface_loss
 
-        # confidence
-        self.use_confidence_loss = experiment.use_confidence_loss
-
-        # zij
-        self.use_zij_loss = experiment.use_zij_loss
+        # contact
+        self.use_contact_loss = experiment.use_contact_loss
 
         # diffuser
         if self.perturb_tr:
@@ -68,15 +63,16 @@ class Score_Model(pl.LightningModule):
             self.so3_diffuser = SO3Diffuser(diffuser.so3)
 
         # net
-        self.net = Score_Net(model)
+        module = importlib.import_module(f"dfmdock.models.{model.file_name}")
+        self.net = module.Score_Net(model)
     
     def forward(self, batch):
         outputs = self.net(batch, predict=True)
         return outputs
 
     def get_energy(self, batch):
-        outputs = self.net(batch, return_energy=True)
-        return outputs
+        energy = self.net(batch, return_energy=True)
+        return energy
 
     def loss_fn(self, batch, eps=1e-5):
         with torch.no_grad():
@@ -109,14 +105,6 @@ class Score_Model(pl.LightningModule):
             # update poses          
             batch["lig_pos"] = self.modify_coords(batch["lig_pos"], rot_update, tr_update)
 
-            # get dockq
-            dockq = get_DockQ((batch["rec_pos"], batch["lig_pos"]), (batch_gt["rec_pos"], batch_gt["lig_pos"]))
-            
-            # get zij
-            d_model = torch.norm((batch["rec_pos"][:, None, 1, :] - batch["lig_pos"][None, :, 1, :]), dim=-1)
-            d_true = torch.norm((batch_gt["rec_pos"][:, None, 1, :] - batch_gt["lig_pos"][None, :, 1, :]), dim=-1)
-            zij = get_dij(d_model, d_true)
-
         # predict score based on the current state
         if self.grad_energy:
             outputs = self.net(batch)
@@ -136,11 +124,12 @@ class Score_Model(pl.LightningModule):
                 dedx_mag = torch.norm(dedx, dim=-1, keepdim=True)
                 dedx_dir = dedx / (dedx_mag + 1e-6)
 
-                ec_dir_loss = torch.mean((f_dir - dedx_dir)**2)
-                ec_mag_loss = torch.mean((f_mag - dedx_mag)**2)
-                ec_loss = 0.5 * (ec_dir_loss + ec_mag_loss)
-                #ec_loss = ec_dir_loss + ec_mag_loss
-                
+                #print(f_mag.mean(), dedx_mag.mean())
+
+                ec_dir_loss = torch.mean((dedx_dir - f_dir)**2)
+                ec_mag_loss = torch.mean((dedx_mag - f_mag)**2)
+                ec_loss = 0.5 * ec_dir_loss + 0.5 * ec_mag_loss 
+
             else:
                 ec_loss = torch.mean((dedx - f)**2)
         else:
@@ -163,10 +152,11 @@ class Score_Model(pl.LightningModule):
                 pred_tr_mag = torch.norm(tr_score, dim=-1, keepdim=True)
                 pred_tr_dir = tr_score / (pred_tr_mag + 1e-6)
 
+                #print(gt_tr_mag, pred_tr_mag, tr_score_scale)
+
                 tr_dir_loss = torch.mean((pred_tr_dir - gt_tr_dir)**2)
                 tr_mag_loss = torch.mean((pred_tr_mag - gt_tr_mag)**2 / tr_score_scale**2)
-                tr_loss = 0.5 * (tr_dir_loss + tr_mag_loss)
-                #tr_loss = tr_dir_loss + 0.1 * tr_mag_loss
+                tr_loss = 0.5 * tr_dir_loss + 0.5 * tr_mag_loss
 
             else:
                 tr_loss = torch.mean((tr_score - tr_score_gt)**2 / tr_score_scale**2)
@@ -182,10 +172,11 @@ class Score_Model(pl.LightningModule):
                 pred_rot_mag = torch.norm(rot_score, dim=-1, keepdim=True)
                 pred_rot_dir = rot_score / (pred_rot_mag + 1e-6)
 
+                #print(gt_rot_mag, pred_rot_mag, rot_score_scale)
+
                 rot_dir_loss = torch.mean((pred_rot_dir - gt_rot_dir)**2)
                 rot_mag_loss = torch.mean((pred_rot_mag - gt_rot_mag)**2 / rot_score_scale**2)
-                rot_loss = 0.5 * (rot_dir_loss + rot_mag_loss)
-                #rot_loss = rot_dir_loss + 0.1 * rot_mag_loss
+                rot_loss = 0.5 * rot_dir_loss + 0.5 * rot_mag_loss
 
             else:
                 rot_loss = torch.mean((rot_score - rot_score_gt)**2 / rot_score_scale**2)
@@ -195,7 +186,7 @@ class Score_Model(pl.LightningModule):
         # contrastive loss
         # modified from https://github.com/yilundu/ired_code_release/blob/main/diffusion_lib/denoising_diffusion_pytorch_1d.py
         if self.use_contrastive_loss:
-            energy_gt = self.net(batch_gt, return_energy=True)["energy"]
+            energy_gt = self.net(batch_gt, return_energy=True)
             energy_stack = torch.stack([energy_gt, energy_noised], dim=-1)
             target = torch.zeros([], device=energy_stack.device)
             el_loss = F.cross_entropy(-1 * energy_stack, target.long(), reduction='none')
@@ -209,48 +200,34 @@ class Score_Model(pl.LightningModule):
         else:
             ires_loss = torch.tensor(0.0, device=self.device)
         
-        # confidence loss
-        if self.use_confidence_loss:
-            confidence_loss = torch.mean((outputs["confidence"] - dockq) ** 2)
+        # contact loss
+        if self.use_contact_loss:
+            gt_dist = torch.norm(batch_gt["rec_pos"][:, None, 1, :] - batch_gt["lig_pos"][None, :, 1, :], dim=-1, keepdim=True)
+            cut_off = 10.0
+            gt_contact = (gt_dist < cut_off).float()
+            contact_loss = focal_loss(outputs['contact'], gt_contact)
         else:
-            confidence_loss = torch.tensor(0.0, device=self.device)
-
-        # zij loss
-        if self.use_zij_loss:
-            #zij, mask = get_zij(batch, batch_gt)
-            #zij_loss = torch.mean((outputs["zij"] - zij) ** 2)
-            #zij_score = zij.mean()
-            #zij_loss = ((outputs["zij"] - zij)**2 * mask).sum() / (mask.sum() + 1e-6)
-            #zij_score = (zij * mask).sum() / (mask.sum() + 1e-6)
-            #print("zij: ", zij)
-            #print("zscore: ", zij_score)
-            #print("dockq: ", dockq)
-
-            zij_loss = torch.mean((outputs["zij"] - zij)**2)
-            #zij_score = zij.mean()
-            #print("zscore: ", zij_score)
-            #print("dockq: ", dockq)
-
-        else:
-            zij_loss = torch.tensor(0.0, device=self.device)
+            contact_loss = torch.tensor(0.0, device=self.device)
 
         # total losses
-        loss = tr_loss + rot_loss + ec_loss + el_loss + ires_loss + confidence_loss + 0.1 * zij_loss
+        loss = tr_loss + rot_loss + ec_loss + el_loss + ires_loss + contact_loss
         losses = {
             "tr_loss": tr_loss, 
             "rot_loss": rot_loss, 
             "ec_loss": ec_loss, 
             "el_loss": el_loss, 
             "ires_loss": ires_loss,
-            "confidence_loss": confidence_loss,
-            "zij_loss": zij_loss,
+            "contact_loss": contact_loss,
             "loss": loss,
         }
 
-        if self.separate_tr_loss:
+        if (self.grad_energy and self.separate_energy_loss):
+            losses["ec_dir_loss"] = ec_dir_loss
+            losses["ec_mag_loss"] = ec_mag_loss
+        if (self.perturb_tr and self.separate_tr_loss):
             losses["tr_dir_loss"] = tr_dir_loss
             losses["tr_mag_loss"] = tr_mag_loss
-        if self.separate_rot_loss:
+        if (self.perturb_rot and self.separate_rot_loss):
             losses["rot_dir_loss"] = rot_dir_loss
             losses["rot_mag_loss"] = rot_mag_loss
 
@@ -271,6 +248,20 @@ class Score_Model(pl.LightningModule):
         lig_pos = batch['lig_pos'].squeeze(0)
         position_matrix = batch['position_matrix'].squeeze(0)
         ires = batch['ires'].squeeze(0)
+
+        # interface embedding
+        if random.random() < 0.5:
+            indices = ires.nonzero(as_tuple=True)[0]
+            k = min(random.randint(1, 4), len(indices))
+            index = torch.randperm(len(indices))[:k]
+            sampled_indices = indices[index]
+            sampled_ires = torch.zeros_like(ires)
+            sampled_ires[sampled_indices] = 1.0
+        else:
+            sampled_ires = torch.zeros_like(ires)
+                    
+        rec_x = torch.cat([rec_x, sampled_ires[:rec_x.size(0)]], dim=-1)
+        lig_x = torch.cat([lig_x, sampled_ires[rec_x.size(0):]], dim=-1)
 
         # wrap to a batch
         batch = {
@@ -474,82 +465,44 @@ def get_rmsd(pred, label):
     rmsd = torch.sqrt(torch.mean(torch.sum((pred - label) ** 2.0, dim=-1)))
     return rmsd
 
-def get_dij(d_model, d_true, d0=10.0):
-    # Calculate pairwise confidence
-    dij = torch.where(
-        (d_model < 10) & (d_true < 10),  # Condition: both d_model and d_true < 10
-        torch.tensor(1.0),  # If condition is true, set confidence to 1
-        1.0 / (1.0 + (torch.abs(d_model - d_true) / d0) ** 2)  # Else, calculate the given formula
-    )
-    return dij
+def focal_loss(inputs, targets, alpha=0.25, gamma=2.0, reduction='mean'):
+    # Sigmoid to get probabilities
+    p = torch.sigmoid(inputs)
+    
+    # BCE loss per element
+    bce_loss = F.binary_cross_entropy_with_logits(inputs, targets, reduction='none')
+    
+    # pt is prob of the true class
+    pt = p * targets + (1 - p) * (1 - targets)
+    
+    # focal loss weighting
+    focal_weight = (1 - pt) ** gamma
+    
+    loss = focal_weight * bce_loss
 
-def get_aij(a_model, a_true, a0=torch.pi / 4):
-    # Convert degrees to radians
-    a_true = torch.deg2rad(a_true)
-    a_model = torch.deg2rad(a_model)
-
-    # Ensure values are in the range [0, 2π]
-    a_true = a_true % (2 * torch.pi)
-    a_model = a_model % (2 * torch.pi)
-
-    diff = torch.abs(a_true - a_model)
-    min_diff = torch.min(diff, 2 * torch.pi - diff)
-    aij = 1.0 / (1.0 + (min_diff / a0) ** 2)
-    return aij
-
-def get_zij(batch, batch_gt):
-    n = batch["rec_pos"].size(0)
-    pos_model = torch.cat([batch["rec_pos"], batch["lig_pos"]], dim=0)
-    pos_gt = torch.cat([batch_gt["rec_pos"], batch_gt["lig_pos"]], dim=0)
-    dist_model, omega_model, theta_model, phi_model = get_coords6d(pos_model)
-    dist_gt, omega_gt, theta_gt, phi_gt = get_coords6d(pos_gt)
-    dist_ij_model = dist_model[:n, n:]
-    omega_ij_model = omega_model[:n, n:]
-    theta_ij_model = theta_model[:n, n:]
-    theta_ji_model = theta_model[n:, :n].T
-    phi_ij_model = phi_model[:n, n:]
-    phi_ji_model = phi_model[n:, :n].T
-    dist_ij_gt = dist_gt[:n, n:]
-    omega_ij_gt = omega_gt[:n, n:]
-    theta_ij_gt = theta_gt[:n, n:]
-    theta_ji_gt = theta_gt[n:, :n].T
-    phi_ij_gt = phi_gt[:n, n:]
-    phi_ji_gt = phi_gt[n:, :n].T
-
-    dist_ij = get_dij(dist_ij_model, dist_ij_gt, d0=10.0)
-    omega_ij = get_aij(omega_ij_model, omega_ij_gt, a0=torch.pi / 4)
-    theta_ij = get_aij(theta_ij_model, theta_ij_gt, a0=torch.pi / 4)
-    theta_ji = get_aij(theta_ji_model, theta_ji_gt, a0=torch.pi / 4)
-    phi_ij = get_aij(phi_ij_model, phi_ij_gt, a0=torch.pi / 8)
-    phi_ji = get_aij(phi_ji_model, phi_ji_gt, a0=torch.pi / 8)
-
-    mask = (dist_ij_model < 10.0).float()
-
-    """
-    print((dist_ij * mask).sum() / (mask.sum() + 1e-6))
-    print((omega_ij * mask).sum() / (mask.sum() + 1e-6))
-    print((theta_ij * mask).sum() / (mask.sum() + 1e-6))
-    print((theta_ji * mask).sum() / (mask.sum() + 1e-6))
-    print((phi_ij * mask).sum() / (mask.sum() + 1e-6))
-    print((phi_ji * mask).sum() / (mask.sum() + 1e-6))
-    """
-
-    zij = torch.stack([dist_ij, omega_ij, theta_ij, theta_ji, phi_ij, phi_ji], dim=-1)
-    mask = (dist_ij_model < 10.0).float().unsqueeze(-1).repeat(1, 1, 6)
-    return zij, mask
-
+    if alpha >= 0:
+        alpha_t = alpha * targets + (1 - alpha) * (1 - targets)
+        loss = alpha_t * loss
+    
+    if reduction == 'mean':
+        return loss.mean()
+    elif reduction == 'sum':
+        return loss.sum()
+    else:
+        return loss 
 
 #----------------------------------------------------------------------------
 # Testing run
 
-@hydra.main(version_base=None, config_path="/scratch4/jgray21/lchu11/graylab_repos/DFMDock/configs/model", config_name="score_model_confidence.yaml")
+@hydra.main(version_base=None, config_path="/scratch4/jgray21/lchu11/graylab_repos/DFMDock/configs/model", config_name="score_model_interface.yaml")
 def main(conf: DictConfig):
-    dataset = PPDockingDataset(
-        dataset='pinder_train',
-        crop_size=500,
+    dataset = PPIDataset(
+        dataset='dips_train',
+        crop_size=1200,
     )
+    index = random.randint(0, len(dataset) - 1)
 
-    subset_indices = [0]
+    subset_indices = [index]
     subset = data.Subset(dataset, subset_indices)
 
     #load dataset

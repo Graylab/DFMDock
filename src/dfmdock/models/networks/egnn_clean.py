@@ -64,45 +64,35 @@ class E_GCL(nn.Module):
         edge_coords_nf = 1 
 
         self.edge_mlp = nn.Sequential(
-            nn.Linear(input_edge + edge_coords_nf + edges_in_d, hidden_nf),
+            nn.Linear(input_edge + edge_coords_nf + edges_in_d, hidden_nf, bias=False),
             act_fn,
-            nn.Linear(hidden_nf, hidden_nf),
+            nn.Linear(hidden_nf, hidden_nf, bias=False),
             act_fn)
 
         self.node_mlp = nn.Sequential(
-            nn.Linear(hidden_nf + input_nf, hidden_nf),
+            nn.Linear(hidden_nf + input_nf, hidden_nf, bias=False),
             GraphNorm(hidden_nf),
             act_fn,
-            nn.Linear(hidden_nf, output_nf))
+            nn.Linear(hidden_nf, output_nf, bias=False))
 
         if self.update_coords:
-            # translation
-            tr_layer = nn.Linear(hidden_nf, 1, bias=False)
-            torch.nn.init.xavier_uniform_(tr_layer.weight, gain=0.001)
+            layer = nn.Linear(hidden_nf, 1, bias=False)
+            #torch.nn.init.normal_(layer.weight, mean=0, std=0.01)
+            #torch.nn.init.xavier_uniform_(layer.weight, gain=0.001)
+            #torch.nn.init.kaiming_uniform_(layer.weight, nonlinearity='relu')
+            #torch.nn.init.zeros_(layer.weight)
 
-            tr_mlp = []
-            tr_mlp.append(nn.Linear(hidden_nf, hidden_nf))
-            tr_mlp.append(act_fn)
-            tr_mlp.append(tr_layer)
+            coord_mlp = []
+            coord_mlp.append(nn.Linear(hidden_nf, hidden_nf, bias=False))
+            coord_mlp.append(act_fn)
+            coord_mlp.append(layer)
             if self.tanh:
-                tr_mlp.append(nn.Tanh())
-            self.tr_mlp = nn.Sequential(*tr_mlp)
-
-            # rotation
-            rot_layer = nn.Linear(hidden_nf, 1, bias=False)
-            torch.nn.init.xavier_uniform_(rot_layer.weight, gain=0.001)
-
-            rot_mlp = []
-            rot_mlp.append(nn.Linear(hidden_nf, hidden_nf))
-            rot_mlp.append(act_fn)
-            rot_mlp.append(rot_layer)
-            if self.tanh:
-                rot_mlp.append(nn.Tanh())
-            self.rot_mlp = nn.Sequential(*rot_mlp)
+                coord_mlp.append(nn.Tanh())
+            self.coord_mlp = nn.Sequential(*coord_mlp)
 
         if self.attention:
             self.att_mlp = nn.Sequential(
-                nn.Linear(hidden_nf, 1),
+                nn.Linear(hidden_nf, 1, bias=False),
                 nn.Sigmoid())
 
     def edge_model(self, source, target, radial, edge_attr):
@@ -128,9 +118,9 @@ class E_GCL(nn.Module):
             out = x + out
         return out, agg
 
-    def tr_model(self, coord, edge_index, coord_diff, edge_feat, lig_mask):
+    def coord_model(self, coord, edge_index, coord_diff, edge_feat, lig_mask):
         row, col = edge_index
-        coord_weights = self.tr_mlp(edge_feat)
+        coord_weights = self.coord_mlp(edge_feat)
 
         if self.coord_weights_clamp_value is not None:
             clamp_value = self.coord_weights_clamp_value
@@ -143,26 +133,11 @@ class E_GCL(nn.Module):
             agg = unsorted_segment_mean(trans, row, num_segments=coord.size(0))
         else:
             raise Exception('Wrong coords_agg parameter' % self.coords_agg)
-
-        return agg
-
-    def rot_model(self, coord, edge_index, coord_diff, edge_feat, lig_mask):
-        row, col = edge_index
-        coord_weights = self.rot_mlp(edge_feat)
-
-        if self.coord_weights_clamp_value is not None:
-            clamp_value = self.coord_weights_clamp_value
-            coord_weights.clamp_(min = -clamp_value, max = clamp_value)
-
-        trans = coord_diff * coord_weights
-        if self.coords_agg == 'sum':
-            agg = unsorted_segment_sum(trans, row, num_segments=coord.size(0))
-        elif self.coords_agg == 'mean':
-            agg = unsorted_segment_mean(trans, row, num_segments=coord.size(0))
+        if lig_mask is not None:
+            coord = coord + agg * lig_mask[:, None]
         else:
-            raise Exception('Wrong coords_agg parameter' % self.coords_agg)
-
-        return agg
+            coord = coord + agg
+        return coord
 
     def coord2radial(self, edge_index, coord):
         row, col = edge_index
@@ -180,11 +155,8 @@ class E_GCL(nn.Module):
         radial, coord_diff = self.coord2radial(edge_index, coord)
 
         edge_feat = self.edge_model(h[row], h[col], radial, edge_attr)
+        if self.update_coords:
+            coord = self.coord_model(coord, edge_index, coord_diff, edge_feat, lig_mask)
         h, agg = self.node_model(h, edge_index, edge_feat, node_attr)
 
-        if self.update_coords:
-            tr_update = self.tr_model(coord, edge_index, coord_diff, edge_feat, lig_mask)
-            rot_update = self.rot_model(coord, edge_index, coord_diff, edge_feat, lig_mask)
-            return h, coord, edge_attr, tr_update, rot_update
-        else:
-            return h, coord, edge_attr
+        return h, coord, edge_attr

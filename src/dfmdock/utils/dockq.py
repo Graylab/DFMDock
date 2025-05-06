@@ -1,6 +1,6 @@
 import torch
 
-def get_DockQ(model, native):
+def get_dockq(model, native):
     # get inputs
     model_rec = model[0].squeeze()
     model_lig = model[1].squeeze()
@@ -13,8 +13,8 @@ def get_DockQ(model, native):
     fnat = get_fnat(model_rec, model_lig, native_rec, native_lig)
     i_rmsd_scaled = 1.0 / (1.0 + (i_rmsd/1.5)**2)
     l_rmsd_scaled = 1.0 / (1.0 + (l_rmsd/8.5)**2)
-    DockQ = (fnat + i_rmsd_scaled + l_rmsd_scaled) / 3
-    return DockQ
+    dockq = (fnat + i_rmsd_scaled + l_rmsd_scaled) / 3
+    return dockq, i_rmsd, l_rmsd, fnat
     
 def get_interface_res(x1, x2, cutoff=10.0):
     # Calculate pairwise distances
@@ -34,6 +34,8 @@ def get_i_rmsd(model_rec, model_lig, native_rec, native_lig):
     res1, res2 = get_interface_res(native_rec, native_lig, cutoff=10.0)
     pred = torch.cat([model_rec[res1], model_lig[res2]], dim=0).flatten(end_dim=1)
     label = torch.cat([native_rec[res1], native_lig[res2]], dim=0).flatten(end_dim=1)
+    R, t = find_rigid_alignment(pred, label)
+    pred = (R.mm(pred.T)).T + t
     return get_rmsd(pred, label)
 
 def get_l_rmsd(model_rec, model_lig, native_rec, native_lig):
@@ -41,6 +43,8 @@ def get_l_rmsd(model_rec, model_lig, native_rec, native_lig):
     model_lig = model_lig.flatten(end_dim=1)
     native_rec = native_rec.flatten(end_dim=1)
     native_lig = native_lig.flatten(end_dim=1)
+    R, t = find_rigid_alignment(model_rec, native_rec)
+    model_lig = (R.mm(model_lig.T)).T + t
     return get_rmsd(model_lig, native_lig)
 
 def get_fnat(model_rec, model_lig, native_rec, native_lig, cutoff=5.5):

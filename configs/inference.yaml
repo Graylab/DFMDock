@@ -22,3 +22,4 @@ data:
   use_tm_score: False
   use_corrector: False
   randomize: True
+  num_ires: 0

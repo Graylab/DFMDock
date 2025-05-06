@@ -19,6 +19,9 @@ class R3Diffuser:
 
     def sigma(self, t):
         return self.min_sigma * (self.max_sigma / self.min_sigma) ** t
+    
+    def torch_sigma(self, t):
+        return self.min_sigma * (self.max_sigma / self.min_sigma) ** t
 
     def diffusion_coef(self, t):
         return self.sigma(t) * np.sqrt(2 * (np.log(self.max_sigma) - np.log(self.min_sigma))) 
@@ -47,11 +50,29 @@ class R3Diffuser:
         ):
         if not np.isscalar(t): raise ValueError(f'{t} must be a scalar.')
         g_t = self.diffusion_coef(t)
+
         if not ode:
             z = noise_scale * torch.randn(1, 3, device=score_t.device)
             perturb = (g_t ** 2) * score_t * dt + g_t * torch.sqrt(dt) * z
         else:
             perturb = 0.5 * (g_t ** 2) * score_t * dt
+        return perturb.float()
+
+    def torch_reverse_langevin(
+            self,
+            score_t: torch.tensor,
+            dt: torch.tensor,
+            t: float,
+            noise_scale: float=1.0,
+            ode: bool=False,
+        ):
+        if not np.isscalar(t): raise ValueError(f'{t} must be a scalar.')
+
+        if not ode:
+            z = noise_scale * torch.randn(1, 3, device=score_t.device)
+            perturb = 0.5 * score_t * dt + torch.sqrt(dt) * z
+        else:
+            perturb = 0.5 * score_t * dt
         return perturb.float()
 
     def torch_corrector(

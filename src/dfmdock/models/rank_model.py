@@ -6,17 +6,16 @@ import torch.nn.functional as F
 import pytorch_lightning as pl
 import numpy as np
 import random
+import importlib
 from torch.utils import data
 from torch_geometric.loader import DataLoader
 from scipy.spatial.transform import Rotation
 from omegaconf import DictConfig
 from dfmdock.models.score_model import Score_Model
-from dfmdock.models.score_net import Score_Net
 from dfmdock.utils.so3_diffuser import SO3Diffuser 
 from dfmdock.utils.r3_diffuser import R3Diffuser 
 from dfmdock.utils.geometry import axis_angle_to_matrix, matrix_to_axis_angle
-from dfmdock.utils.dockq import get_DockQ
-from dfmdock.datasets.pp_docking_dataset import PPDockingDataset
+from dfmdock.utils.dockq import get_dockq
 from dfmdock.datasets.ppi_mlsb_dataset import PPIDataset
 
 #----------------------------------------------------------------------------
@@ -60,15 +59,17 @@ class Rank_Model(pl.LightningModule):
         self.use_contact_loss = experiment.use_contact_loss
 
         # load score model
-        self.score_model = Score_Model.load_from_checkpoint(
-            experiment.ckpt, 
-            map_location=self.device,
-        )
-        self.score_model.eval()
-        self.score_model.to(self.device)
+        if self.training:
+            self.score_model = Score_Model.load_from_checkpoint(
+                experiment.ckpt, 
+                map_location=self.device,
+            )
+            self.score_model.eval()
+            self.score_model.to(self.device)
         
-        # score net
-        self.score_net = Score_Net(model)
+        # net
+        module = importlib.import_module(f"dfmdock.models.{model.file_name}")
+        self.net = module.Rank_Net(model)
     
     def forward(self, batch):
         outputs = self.net(batch, predict=True)
@@ -87,26 +88,14 @@ class Rank_Model(pl.LightningModule):
             batch["rec_pos"], batch["lig_pos"] = self.Euler_Maruyama_sampler(batch)
 
             # get dockq
-            dockq = get_DockQ((batch["rec_pos"], batch["lig_pos"]), (batch_gt["rec_pos"], batch_gt["lig_pos"]))
+            dockq, i_rmsd, l_rmsd, fnat = get_dockq((batch["rec_pos"], batch["lig_pos"]), (batch_gt["rec_pos"], batch_gt["lig_pos"]))
+            print(dockq, i_rmsd, l_rmsd, fnat)
 
-        energy_noised = self.score_net(batch, return_energy=True)
+        confidence = self.net(batch)
+        bce_logits_loss = nn.BCEWithLogitsLoss()
+        loss = bce_logits_loss(confidence, (l_rmsd < 5.0).float())
 
-        # contrastive loss
-        # modified from https://github.com/yilundu/ired_code_release/blob/main/diffusion_lib/denoising_diffusion_pytorch_1d.py
-        if self.use_contrastive_loss:
-            energy_gt = self.score_net(batch_gt, return_energy=True)
-            energy_stack = torch.stack([energy_gt, energy_noised], dim=-1)
-            target = torch.zeros([], device=energy_stack.device)
-            el_loss = F.cross_entropy(-1 * energy_stack, target.long(), reduction='none')
-            # weight by dockq
-            el_loss = el_loss * (1.0 - dockq)
-        else: 
-            el_loss = torch.tensor(0.0, device=self.device) 
-
-        # total losses
-        loss = el_loss
         losses = {
-            "el_loss": el_loss, 
             "loss": loss,
         }
 
@@ -181,7 +170,6 @@ class Rank_Model(pl.LightningModule):
 
     def validation_step(self, batch, batch_idx):
         losses = self.step(batch, batch_idx)
-        #dockq = self.inference(batch)
         for loss_name, indiv_loss in losses.items():
             self.log(
                 f"val/{loss_name}", 
@@ -208,91 +196,69 @@ class Rank_Model(pl.LightningModule):
         )
         return optimizer
     
-    def compute_dockq(self, batch):
-        rec_x = batch['rec_x'].squeeze(0)
-        lig_x = batch['lig_x'].squeeze(0)
-        rec_pos = batch['rec_pos'].squeeze(0)
-        lig_pos = batch['lig_pos'].squeeze(0)
-        position_matrix = batch['position_matrix'].squeeze(0)
-        ires = batch['ires'].squeeze(0)
-
-        # wrap to a batch
-        batch = {
-            "rec_x": rec_x,
-            "lig_x": lig_x,
-            "rec_pos": rec_pos,
-            "lig_pos": lig_pos,
-            "position_matrix": position_matrix,
-            "ires": ires,
-        }
-
-        _rec_pos, _lig_pos = self.Euler_Maruyama_sampler(batch)
-        dockq = get_DockQ((_rec_pos, _lig_pos), (rec_pos, lig_pos))
-        return dockq
-
     def Euler_Maruyama_sampler(
-        self,
-        batch,
-        batch_size=1, 
-        eps=1e-3,
-        num_steps=20,
-    ):
-        # initialize time steps
-        t = torch.ones(batch_size, device=self.device)
-        time_steps = torch.linspace(1., eps, num_steps, device=self.device)
-        dt = time_steps[0] - time_steps[1]
+            self,
+            batch,
+            batch_size=1, 
+            num_steps=40,
+        ):
 
-        # get initial pose
-        rec_pos = batch["rec_pos"] 
-        lig_pos = batch["lig_pos"] 
+            # initialize time steps
+            t = torch.ones(batch_size, device=self.device)
+            time_steps = torch.linspace(1., 0., num_steps, device=self.device)
+            dt = time_steps[0] - time_steps[1]
 
-        # randomly initialize coordinates
-        rec_pos, lig_pos, rot_update, tr_update = self.randomize_pose(rec_pos, lig_pos)
-        
-        # run reverse sde 
-        with torch.no_grad():
-            for i, time_step in enumerate(time_steps):  
-                # get current time step 
-                is_last = i == time_steps.size(0) - 1   
-                t = torch.ones(batch_size, device=self.device) * time_step
+            # get initial pose
+            rec_pos = batch["rec_pos"] 
+            lig_pos = batch["lig_pos"] 
 
-                batch["t"] = t
-                batch["rec_pos"] = rec_pos.detach().clone()
-                batch["lig_pos"] = lig_pos.detach().clone()
+            # randomly initialize coordinates
+            rec_pos, lig_pos = self.initialize_ligand_far_from_receptor(rec_pos, lig_pos)
+            
+            # run reverse sde 
+            with torch.no_grad():
+                for i, time_step in enumerate((time_steps[:-1])):  
+                    # get current time step 
+                    is_last = i == time_steps.size(0) - 2
+                    t = torch.ones(batch_size, device=self.device) * time_step
 
-                # get predictions
-                output = self.score_model(batch) 
+                    batch["t"] = t
+                    batch["rec_pos"] = rec_pos.detach().clone()
+                    batch["lig_pos"] = lig_pos.detach().clone()
 
-                if not is_last:
-                    tr_noise_scale = 0.5
-                    rot_noise_scale = 0.5
-                else:
-                    tr_noise_scale = 0.0
-                    rot_noise_scale = 0.0
+                    # get predictions
+                    output = self.score_model(batch) 
 
-                if self.perturb_rot:
-                    rot = self.score_model.so3_diffuser.torch_reverse(
-                        score_t=output["rot_score"].detach(),
-                        t=t.item(),
-                        dt=dt,
-                        noise_scale=rot_noise_scale,
-                    )
-                else:
-                    rot = torch.zeros((1, 3), device=self.device)
+                    if not is_last:
+                        tr_noise_scale = 0.5
+                        rot_noise_scale = 0.5
+                    else:
+                        tr_noise_scale = 0.0
+                        rot_noise_scale = 0.0
 
-                if self.perturb_tr:
-                    tr = self.score_model.r3_diffuser.torch_reverse(
-                        score_t=output["tr_score"].detach(),
-                        t=t.item(),
-                        dt=dt,
-                        noise_scale=tr_noise_scale,
-                    )
-                else:
-                    tr = torch.zeros((1, 3), device=self.device)
+                    if self.perturb_rot:
+                        rot = self.score_model.so3_diffuser.torch_reverse(
+                            score_t=output["rot_score"].detach(),
+                            t=t.item(),
+                            dt=dt,
+                            noise_scale=rot_noise_scale,
+                        )
+                    else:
+                        rot = torch.zeros((1, 3), device=self.device)
 
-                lig_pos = self.modify_coords(lig_pos, rot, tr)
-                
-        return rec_pos, lig_pos
+                    if self.perturb_tr:
+                        tr = self.score_model.r3_diffuser.torch_reverse(
+                            score_t=output["tr_score"].detach(),
+                            t=t.item(),
+                            dt=dt,
+                            noise_scale=tr_noise_scale,
+                        )
+                    else:
+                        tr = torch.zeros((1, 3), device=self.device)
+
+                    lig_pos = self.modify_coords(lig_pos, rot, tr)
+  
+            return rec_pos, lig_pos
 
     def randomize_pose(self, x1, x2):
         # get center of mass
@@ -323,6 +289,38 @@ class Rank_Model(pl.LightningModule):
 
         return x1, x2, rot_update, tr_update
 
+    def initialize_ligand_far_from_receptor(self, x1, x2, max_iter=1000, min_distance=8.0, step=1.0):
+        # get center of mass
+        c1 = torch.mean(x1[..., 1, :], dim=0)
+        c2 = torch.mean(x2[..., 1, :], dim=0)
+
+        # move to origin
+        x1 = x1 - c1
+        x2 = x2 - c2
+
+        # init rotation
+        if self.perturb_rot:
+            # get rotat update
+            rot_update = torch.from_numpy(Rotation.random().as_matrix()).float().to(self.device)
+            x2 = x2 @ rot_update.T
+
+        # init translation
+        if self.perturb_tr:
+            # Sample random unit direction
+            direction = F.normalize(torch.randn(1, 3, device=self.device))
+
+            # Move ligand until min distance is satisfied
+            distance = torch.tensor(step, device=self.device)
+            for _ in range(max_iter):
+                x2 = x2 + distance * direction
+                dists = torch.cdist(x1[..., 1, :], x2[..., 1, :])
+                min_dist = dists.min()
+                if min_dist >= min_distance:
+                    break
+                distance += step
+
+        return x1, x2
+
 #----------------------------------------------------------------------------
 # Helpers
 
@@ -336,7 +334,7 @@ def get_rmsd(pred, label):
 @hydra.main(version_base=None, config_path="/scratch4/jgray21/lchu11/graylab_repos/DFMDock/configs/model", config_name="rank_model.yaml")
 def main(conf: DictConfig):
     dataset = PPIDataset(
-        dataset='pinder_train',
+        dataset='dips_train_hetero',
         crop_size=500,
     )
 

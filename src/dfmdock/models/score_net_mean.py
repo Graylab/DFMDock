@@ -4,7 +4,7 @@ import torch.nn.functional as F
 import numpy as np
 from dataclasses import dataclass
 from einops import repeat
-from dfmdock.models.egnn_model import E_GCL
+from dfmdock.models.egnn import E_GCL
 from dfmdock.utils.coords6d import get_coords6d
 
 #----------------------------------------------------------------------------
@@ -332,35 +332,44 @@ class Score_Net(nn.Module):
 
         # energy head
         self.to_energy = nn.Sequential(
-            nn.Linear(2*node_dim, node_dim),
+            nn.Linear(2*node_dim, node_dim, bias=False),
+            nn.LayerNorm(node_dim),
             nn.SiLU(),
             nn.Linear(node_dim, 1, bias=False),
         )
 
         # interface residue head
         self.to_ires = nn.Sequential(
-            nn.Linear(node_dim, node_dim),
+            nn.Linear(node_dim, 2*node_dim),
             nn.SiLU(),
-            nn.Linear(node_dim, 1),
+            nn.Linear(2*node_dim, 2*node_dim),
+            nn.SiLU(),
+            nn.Linear(2*node_dim, 1),
         )
 
         # timestep embedding
-        self.t_embed = GaussianFourierProjection(embed_dim=inner_dim)
+        self.t_embed = nn.Sequential(
+            GaussianFourierProjection(embed_dim=inner_dim),
+            nn.Linear(inner_dim, inner_dim, bias=False),
+            nn.Sigmoid(),
+        )
 
         # tr_scale mlp
         self.tr_scale = nn.Sequential(
-            nn.Linear(inner_dim + 1, inner_dim),
+            nn.Linear(inner_dim + 1, inner_dim, bias=False),
+            nn.LayerNorm(inner_dim),
             nn.SiLU(),
             nn.Linear(inner_dim, 1, bias=False),
-            nn.Softplus(),
+            nn.Softplus()
         )
 
         # rot_scale mlp
         self.rot_scale = nn.Sequential(
-            nn.Linear(inner_dim + 1, inner_dim),
+            nn.Linear(inner_dim + 1, inner_dim, bias=False),
+            nn.LayerNorm(inner_dim),
             nn.SiLU(),
             nn.Linear(inner_dim, 1, bias=False),
-            nn.Softplus(),
+            nn.Softplus()
         )
 
         self.apply(self._init_weights)
@@ -396,7 +405,7 @@ class Score_Net(nn.Module):
 
         # node feature embedding
         x = torch.cat([rec_x, lig_x], dim=0)
-        node = self.single_embed(x) # [n, c]
+        node = self.single_embed(x)
 
         # edge feature embedding
         spatial_matrix = get_spatial_matrix(pos)
@@ -410,7 +419,7 @@ class Score_Net(nn.Module):
         lig_mask[rec_x.size(0):] = 1.0
 
         # main network 
-        node_out, pos_out, _ = self.network(node, pos[..., 1, :], edge_index, edge_attr, lig_mask) # [R+L, H]
+        node_out, pos_out, _ = self.network(node, pos[..., 1, :], edge_index, edge_attr, lig_mask)
 
         # interface residue
         ires = self.to_ires(node_out)
@@ -418,8 +427,8 @@ class Score_Net(nn.Module):
         # energy
         h_rec = repeat(node_out[:rec_pos.size(0)], 'n h -> n m h', m=lig_pos.size(0))
         h_lig = repeat(node_out[rec_pos.size(0):], 'm h -> n m h', n=rec_pos.size(0))
-        energy = self.to_energy(torch.cat([h_rec, h_lig], dim=-1)).squeeze(-1) # [R, L]
-        mask_2D = (D < self.cut_off).float() # [R, L]
+        energy = self.to_energy(torch.cat([h_rec, h_lig], dim=-1)).squeeze(-1)
+        mask_2D = (D < self.cut_off).float()
         energy = (energy * mask_2D).sum() / (mask_2D.sum() + 1e-6) 
 
         if return_energy:
@@ -428,7 +437,7 @@ class Score_Net(nn.Module):
         # force
         lig_pos_curr = pos_out[rec_pos.size(0):] 
         r = lig_pos[..., 1, :].detach()
-        f = lig_pos_curr - r # f / kT
+        f = lig_pos_curr - r
 
         # translation
         tr_pred = f.mean(dim=0, keepdim=True)
@@ -444,14 +453,11 @@ class Score_Net(nn.Module):
         rot_score = rot_pred / (rot_norm + 1e-6) * self.rot_scale(torch.cat([rot_norm, t], dim=-1))
 
         if predict:
-            num_clashes = get_clashes(D)
-
             outputs = {
                 "tr_score": tr_score,
                 "rot_score": rot_score,
                 "energy": energy,
                 "f": f,
-                "num_clashes": num_clashes,
                 "ires": ires,
             }
 

@@ -5,6 +5,7 @@ warnings.filterwarnings("ignore", category=FutureWarning)
 import os
 import csv
 import torch
+import torch.nn.functional as F
 import numpy as np
 import hydra
 import random
@@ -213,8 +214,8 @@ class Sampler:
             batch = {
                 "rec_x": rec_x,
                 "lig_x": lig_x,
-                "rec_pos": rec_pos.clone().detach(),
-                "lig_pos": lig_pos.clone().detach(),
+                "rec_pos": rec_pos.detach().clone(),
+                "lig_pos": lig_pos.detach().clone(),
                 "position_matrix": position_matrix,
             }
 
@@ -228,23 +229,22 @@ class Sampler:
             )
 
             if self.data_conf.get_gt_energy:
-                batch["t"] = torch.zeros(1, device=self.device) + 1e-5
-                output = self.model(batch)
+                batch["t"] = torch.zeros(1, device=self.device)
+                batch["rec_pos"] = rec_pos.detach().clone()
+                batch["lig_pos"] = lig_pos.detach().clone()
+                energy = self.model.get_energy(batch).detach()
 
                 metrics = {'id': _id}
                 metrics.update(self.get_metrics([rec_pos, lig_pos], [rec_pos, lig_pos]))
-                metrics.update({'energy': output["energy"].item()})
-                metrics.update({'num_clashes': output["num_clashes"].item()})
+                metrics.update({'energy': energy.item()})
                 metrics_list.append(metrics)
             
             else:
                 # run 
                 for i in range(self.data_conf.num_samples):
-                    _rec_pos, _lig_pos, energy, num_clashes = self.Euler_Maruyama_sampler(
+                    _rec_pos, _lig_pos, energy = self.Euler_Maruyama_sampler(
                         batch=batch,
                         batch_size=1,
-                        eps=1e-3,
-                        ode=self.data_conf.ode,
                     )
                     
                     # get predicted pose
@@ -261,7 +261,6 @@ class Sampler:
                     metrics = {'id': _id, 'index': str(i)}
                     metrics.update(self.get_metrics([_rec_pos[-1], _lig_pos[-1]], [rec_pos, lig_pos]))
                     metrics.update({'energy': energy.item()})
-                    metrics.update({'num_clashes': num_clashes.item()})
                     metrics_list.append(metrics)
 
                     if self.data_conf.out_trj:
@@ -271,7 +270,6 @@ class Sampler:
                         self.save_pdb(pred)
 
         return metrics_list
-
 
     def Euler_Maruyama_sampler(
         self,
@@ -286,7 +284,7 @@ class Sampler:
 
         # initialize time steps
         t = torch.ones(batch_size, device=self.device)
-        time_steps = torch.linspace(1., eps, self.data_conf.num_steps, device=self.device)
+        time_steps = torch.linspace(1., 0., self.data_conf.num_steps, device=self.device)
         dt = time_steps[0] - time_steps[1]
 
         # get initial pose
@@ -295,7 +293,8 @@ class Sampler:
 
         # randomly initialize coordinates
         if self.data_conf.randomize:
-            rec_pos, lig_pos, rot_update, tr_update = self.randomize_pose(rec_pos, lig_pos)
+            #rec_pos, lig_pos, rot_update, tr_update = self.randomize_pose(rec_pos, lig_pos)
+            rec_pos, lig_pos = self.initialize_ligand_far_from_receptor(rec_pos, lig_pos)
         
         # save initial coordinates 
         rec_trj.append(rec_pos)
@@ -303,14 +302,14 @@ class Sampler:
 
         # run reverse sde 
         with torch.no_grad():
-            for i, time_step in enumerate(tqdm((time_steps))):  
+            for i, time_step in enumerate(tqdm((time_steps[:-1]))):  
                 # get current time step 
-                is_last = i == time_steps.size(0) - 1   
+                is_last = i == time_steps.size(0) - 2
                 t = torch.ones(batch_size, device=self.device) * time_step
 
                 batch["t"] = t
-                batch["rec_pos"] = rec_pos.clone().detach()
-                batch["lig_pos"] = lig_pos.clone().detach()
+                batch["rec_pos"] = rec_pos.detach().clone()
+                batch["lig_pos"] = lig_pos.detach().clone()
 
                 # get predictions
                 output = self.model(batch) 
@@ -348,19 +347,20 @@ class Sampler:
 
                 # clash
                 if self.data_conf.use_clash_force:
-                    clash_force = self.clash_force(rec_pos.clone().detach(), lig_pos.clone().detach())
+                    clash_force = self.clash_force(rec_pos.detach().clone(), lig_pos.detach().clone())
                     lig_pos = lig_pos + clash_force
 
                 if is_last:
-                    batch["rec_pos"] = rec_pos.clone().detach()
-                    batch["lig_pos"] = lig_pos.clone().detach()
-                    output = self.model(batch) 
+                    batch["t"] = torch.zeros(batch_size, device=self.device)
+                    batch["rec_pos"] = rec_pos.detach().clone()
+                    batch["lig_pos"] = lig_pos.detach().clone()
+                    energy = self.model.get_energy(batch).detach()
 
                 # save coordinates
                 rec_trj.append(rec_pos)         
                 lig_trj.append(lig_pos)
                 
-        return rec_trj, lig_trj, output["energy"], output["num_clashes"]
+        return rec_trj, lig_trj, energy
 
     def randomize_pose(self, x1, x2):
         # get center of mass
@@ -390,6 +390,38 @@ class Sampler:
         rot_update = matrix_to_axis_angle(rot_update.unsqueeze(0))
 
         return x1, x2, rot_update, tr_update
+
+    def initialize_ligand_far_from_receptor(self, x1, x2, max_iter=1000, min_distance=8.0, step=1.0):
+        # get center of mass
+        c1 = torch.mean(x1[..., 1, :], dim=0)
+        c2 = torch.mean(x2[..., 1, :], dim=0)
+
+        # move to origin
+        x1 = x1 - c1
+        x2 = x2 - c2
+
+        # init rotation
+        if self.perturb_rot:
+            # get rotat update
+            rot_update = torch.from_numpy(Rotation.random().as_matrix()).float().to(self.device)
+            x2 = x2 @ rot_update.T
+
+        # init translation
+        if self.perturb_tr:
+            # Sample random unit direction
+            direction = F.normalize(torch.randn(1, 3, device=self.device))
+
+            # Move ligand until min distance is satisfied
+            distance = torch.tensor(step, device=self.device)
+            for _ in range(max_iter):
+                x2 = x2 + distance * direction
+                dists = torch.cdist(x1[..., 1, :], x2[..., 1, :])
+                min_dist = dists.min()
+                if min_dist >= min_distance:
+                    break
+                distance += step
+
+        return x1, x2
 
     def modify_coords(self, x, rot, tr):
         center = torch.mean(x[..., 1, :], dim=0, keepdim=True)

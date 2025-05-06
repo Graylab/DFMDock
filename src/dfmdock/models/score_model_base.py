@@ -14,8 +14,6 @@ from omegaconf import DictConfig
 from dfmdock.utils.so3_diffuser import SO3Diffuser 
 from dfmdock.utils.r3_diffuser import R3Diffuser 
 from dfmdock.utils.geometry import axis_angle_to_matrix, matrix_to_axis_angle
-from dfmdock.utils.dockq import get_DockQ
-from dfmdock.datasets.pp_docking_dataset import PPDockingDataset
 from dfmdock.datasets.ppi_mlsb_dataset import PPIDataset
 
 #----------------------------------------------------------------------------
@@ -56,7 +54,7 @@ class Score_Model(pl.LightningModule):
         self.use_interface_loss = experiment.use_interface_loss
 
         # contact
-        self.use_contact_loss = experiment.use_contact_loss
+        self.use_energy_gt_loss = experiment.use_energy_gt_loss
 
         # diffuser
         if self.perturb_tr:
@@ -107,8 +105,8 @@ class Score_Model(pl.LightningModule):
             # update poses          
             batch["lig_pos"] = self.modify_coords(batch["lig_pos"], rot_update, tr_update)
 
-            # get dockq
-            dockq = get_DockQ((batch["rec_pos"], batch["lig_pos"]), (batch_gt["rec_pos"], batch_gt["lig_pos"]))
+            # number of lig nodes
+            n = batch["lig_pos"].size(0)
 
         # predict score based on the current state
         if self.grad_energy:
@@ -117,35 +115,28 @@ class Score_Model(pl.LightningModule):
             # grab some outputs
             tr_score = outputs["tr_score"]
             rot_score = outputs["rot_score"]
-            force = outputs["force"]
-            torque = outputs["torque"]
-            grad_force = outputs["grad_force"]
-            grad_torque = outputs["grad_torque"]
+            tr_grad = outputs["tr_grad"]
+            rot_grad = outputs["rot_score"]
+            f = outputs["f"]
+            f_grad = outputs["f_grad"]
             energy_noised = outputs["energy"]
-
-            #print(energy_noised)
-            #print(force.norm())
-            #print(torque.norm())
-            #print(grad_force.norm())
-            #print(grad_torque.norm())
 
             # energy conservation loss
             if self.separate_energy_loss:
                 f_mag = torch.norm(f, dim=-1, keepdim=True)
                 f_dir = f / (f_mag + 1e-6)
 
-                dedx_mag = torch.norm(dedx, dim=-1, keepdim=True)
-                dedx_dir = dedx / (dedx_mag + 1e-6)
+                f_grad_mag = torch.norm(f_grad, dim=-1, keepdim=True)
+                f_grad_dir = f_grad / (f_grad_mag + 1e-6)
 
-                ec_dir_loss = torch.mean((f_dir - dedx_dir)**2)
-                ec_mag_loss = torch.mean((f_mag - dedx_mag)**2)
-                ec_loss = 0.5 * (ec_dir_loss + ec_mag_loss)
-                #ec_loss = ec_dir_loss + ec_mag_loss
-                
+                #print(f_mag.mean(), f_grad_mag.mean())
+
+                ec_dir_loss = torch.mean((f_grad_dir - f_dir)**2)
+                ec_mag_loss = torch.mean((f_grad_mag - f_mag)**2) 
+                ec_loss = 0.5 * ec_dir_loss + 0.5 * ec_mag_loss 
+
             else:
-                ec_tr_loss = torch.mean((grad_force - force)**2)
-                ec_rot_loss = torch.mean((grad_torque - torque)**2)
-                ec_loss = ec_tr_loss + ec_rot_loss
+                ec_loss = torch.mean((f_grad - f)**2) 
         else:
             outputs = self.net(batch, predict=True)
 
@@ -166,11 +157,22 @@ class Score_Model(pl.LightningModule):
                 pred_tr_mag = torch.norm(tr_score, dim=-1, keepdim=True)
                 pred_tr_dir = tr_score / (pred_tr_mag + 1e-6)
 
+                #print(gt_tr_mag, pred_tr_mag, tr_score_scale)
+                #print(tr_sigma, 1.0 / tr_score_scale)
+
                 tr_dir_loss = torch.mean((pred_tr_dir - gt_tr_dir)**2)
                 tr_mag_loss = torch.mean((pred_tr_mag - gt_tr_mag)**2 / tr_score_scale**2)
-                tr_loss = 0.5 * (tr_dir_loss + tr_mag_loss)
-                #tr_loss = tr_dir_loss + 0.1 * tr_mag_loss
-
+                tr_loss = 0.5 * tr_dir_loss + 0.5 * tr_mag_loss
+                
+                if self.use_energy_gt_loss:
+                    pred_tr_grad_mag = torch.norm(tr_grad, dim=-1, keepdim=True)
+                    pred_tr_grad_dir = tr_grad / (pred_tr_grad_mag + 1e-6)
+                    tr_grad_dir_loss = torch.mean((pred_tr_grad_dir - gt_tr_dir)**2)
+                    tr_grad_mag_loss = torch.mean((pred_tr_grad_mag - gt_tr_mag)**2 / tr_score_scale**2)
+                    tr_grad_loss = 0.5 * tr_grad_dir_loss + 0.5 * tr_grad_mag_loss
+                else:
+                    tr_grad_loss = torch.tensor(0.0, device=self.device) 
+                    
             else:
                 tr_loss = torch.mean((tr_score - tr_score_gt)**2 / tr_score_scale**2)
         else:
@@ -185,10 +187,21 @@ class Score_Model(pl.LightningModule):
                 pred_rot_mag = torch.norm(rot_score, dim=-1, keepdim=True)
                 pred_rot_dir = rot_score / (pred_rot_mag + 1e-6)
 
+                #print(gt_rot_mag, pred_rot_mag, rot_score_scale)
+                #print(rot_sigma, 1.0 / rot_score_scale)
+
                 rot_dir_loss = torch.mean((pred_rot_dir - gt_rot_dir)**2)
                 rot_mag_loss = torch.mean((pred_rot_mag - gt_rot_mag)**2 / rot_score_scale**2)
-                rot_loss = 0.5 * (rot_dir_loss + rot_mag_loss)
-                #rot_loss = rot_dir_loss + 0.1 * rot_mag_loss
+                rot_loss = 0.5 * rot_dir_loss + 0.5 * rot_mag_loss
+
+                if self.use_energy_gt_loss:
+                    pred_rot_grad_mag = torch.norm(rot_grad, dim=-1, keepdim=True)
+                    pred_rot_grad_dir = rot_grad / (pred_rot_grad_mag + 1e-6)
+                    rot_grad_dir_loss = torch.mean((pred_rot_grad_dir - gt_rot_dir)**2)
+                    rot_grad_mag_loss = torch.mean((pred_rot_grad_mag - gt_rot_mag)**2 / rot_score_scale**2)
+                    rot_grad_loss = 0.5 * rot_grad_dir_loss + 0.5 * rot_grad_mag_loss
+                else:
+                    tr_grad_loss = torch.tensor(0.0, device=self.device) 
 
             else:
                 rot_loss = torch.mean((rot_score - rot_score_gt)**2 / rot_score_scale**2)
@@ -202,8 +215,6 @@ class Score_Model(pl.LightningModule):
             energy_stack = torch.stack([energy_gt, energy_noised], dim=-1)
             target = torch.zeros([], device=energy_stack.device)
             el_loss = F.cross_entropy(-1 * energy_stack, target.long(), reduction='none')
-            # weight by dockq
-            el_loss = el_loss * (1.0 - dockq)
         else: 
             el_loss = torch.tensor(0.0, device=self.device) 
 
@@ -214,27 +225,22 @@ class Score_Model(pl.LightningModule):
         else:
             ires_loss = torch.tensor(0.0, device=self.device)
         
-        # contact loss
-        if self.use_contact_loss:
-            gt_dist = torch.norm(batch_gt["rec_pos"][:, None, 1, :] - batch_gt["lig_pos"][None, :, 1, :], dim=-1)
-            cut_off = 10.0
-            gt_contact = (gt_dist < cut_off).float()
-            contact_loss = bce_logits_loss(outputs['contact'], gt_contact.unsqueeze(-1))
-        else:
-            contact_loss = torch.tensor(0.0, device=self.device)
-
         # total losses
-        loss = tr_loss + rot_loss + 0.1 * (ec_loss + el_loss + ires_loss + contact_loss)
+        loss = tr_loss + rot_loss + tr_grad_loss + rot_grad_loss + ec_loss + el_loss + ires_loss
         losses = {
             "tr_loss": tr_loss, 
             "rot_loss": rot_loss, 
+            "tr_grad_loss": tr_grad_loss, 
+            "rot_grad_loss": rot_grad_loss, 
             "ec_loss": ec_loss, 
             "el_loss": el_loss, 
             "ires_loss": ires_loss,
-            "contact_loss": contact_loss,
             "loss": loss,
         }
 
+        if (self.grad_energy and self.separate_energy_loss):
+            losses["ec_dir_loss"] = ec_dir_loss
+            losses["ec_mag_loss"] = ec_mag_loss
         if (self.perturb_tr and self.separate_tr_loss):
             losses["tr_dir_loss"] = tr_dir_loss
             losses["tr_mag_loss"] = tr_mag_loss
@@ -313,7 +319,6 @@ class Score_Model(pl.LightningModule):
 
     def validation_step(self, batch, batch_idx):
         losses = self.step(batch, batch_idx)
-        #dockq = self.inference(batch)
         for loss_name, indiv_loss in losses.items():
             self.log(
                 f"val/{loss_name}", 
@@ -340,139 +345,18 @@ class Score_Model(pl.LightningModule):
         )
         return optimizer
     
-    def compute_dockq(self, batch):
-        rec_x = batch['rec_x'].squeeze(0)
-        lig_x = batch['lig_x'].squeeze(0)
-        rec_pos = batch['rec_pos'].squeeze(0)
-        lig_pos = batch['lig_pos'].squeeze(0)
-        position_matrix = batch['position_matrix'].squeeze(0)
-        ires = batch['ires'].squeeze(0)
-
-        # wrap to a batch
-        batch = {
-            "rec_x": rec_x,
-            "lig_x": lig_x,
-            "rec_pos": rec_pos,
-            "lig_pos": lig_pos,
-            "position_matrix": position_matrix,
-            "ires": ires,
-        }
-
-        _rec_pos, _lig_pos = self.Euler_Maruyama_sampler(batch)
-        dockq = get_DockQ((_rec_pos, _lig_pos), (rec_pos, lig_pos))
-        return dockq
-
-    def Euler_Maruyama_sampler(
-        self,
-        batch,
-        batch_size=1, 
-        eps=1e-3,
-        num_steps=40,
-    ):
-        # initialize time steps
-        t = torch.ones(batch_size, device=self.device)
-        time_steps = torch.linspace(1., eps, num_steps, device=self.device)
-        dt = time_steps[0] - time_steps[1]
-
-        # get initial pose
-        rec_pos = batch["rec_pos"] 
-        lig_pos = batch["lig_pos"] 
-
-        # randomly initialize coordinates
-        rec_pos, lig_pos, rot_update, tr_update = self.randomize_pose(rec_pos, lig_pos)
-        
-        # run reverse sde 
-        with torch.no_grad():
-            for i, time_step in enumerate(time_steps):  
-                # get current time step 
-                is_last = i == time_steps.size(0) - 1   
-                t = torch.ones(batch_size, device=self.device) * time_step
-
-                batch["t"] = t
-                batch["rec_pos"] = rec_pos.detach().clone()
-                batch["lig_pos"] = lig_pos.detach().clone()
-
-                # get predictions
-                output = self.net(batch, predict=True) 
-
-                if not is_last:
-                    tr_noise_scale = 0.5
-                    rot_noise_scale = 0.5
-                else:
-                    tr_noise_scale = 0.0
-                    rot_noise_scale = 0.0
-
-                if self.perturb_rot:
-                    rot = self.so3_diffuser.torch_reverse(
-                        score_t=output["rot_score"].detach(),
-                        t=t.item(),
-                        dt=dt,
-                        noise_scale=rot_noise_scale,
-                    )
-                else:
-                    rot = torch.zeros((1, 3), device=self.device)
-
-                if self.perturb_tr:
-                    tr = self.r3_diffuser.torch_reverse(
-                        score_t=output["tr_score"].detach(),
-                        t=t.item(),
-                        dt=dt,
-                        noise_scale=tr_noise_scale,
-                    )
-                else:
-                    tr = torch.zeros((1, 3), device=self.device)
-
-                lig_pos = self.modify_coords(lig_pos, rot, tr)
-                
-        return rec_pos, lig_pos
-
-    def randomize_pose(self, x1, x2):
-        # get center of mass
-        c1 = torch.mean(x1[..., 1, :], dim=0)
-        c2 = torch.mean(x2[..., 1, :], dim=0)
-
-        # get rotat update
-        rot_update = torch.from_numpy(Rotation.random().as_matrix()).float().to(self.device)
-
-        # get trans update
-        tr_update = torch.normal(0.0, 30.0, size=(1, 3), device=self.device)
-        #tr_update = torch.from_numpy(sample_sphere(radius=50.0)).float().to(self.device)
-
-        # move to origin
-        x1 = x1 - c1
-        x2 = x2 - c2
-
-        # init rotation
-        if self.perturb_rot:
-            x2 = x2 @ rot_update.T
-
-        # init translation
-        if self.perturb_tr:
-            x2 = x2 + tr_update 
-
-        # convert to axis angle
-        rot_update = matrix_to_axis_angle(rot_update.unsqueeze(0))
-
-        return x1, x2, rot_update, tr_update
-
-#----------------------------------------------------------------------------
-# Helpers
-
-def get_rmsd(pred, label):
-    rmsd = torch.sqrt(torch.mean(torch.sum((pred - label) ** 2.0, dim=-1)))
-    return rmsd
-
 #----------------------------------------------------------------------------
 # Testing run
 
 @hydra.main(version_base=None, config_path="/scratch4/jgray21/lchu11/graylab_repos/DFMDock/configs/model", config_name="score_model_base.yaml")
 def main(conf: DictConfig):
     dataset = PPIDataset(
-        dataset='pinder_train',
-        crop_size=500,
+        dataset='dips_train_hetero',
+        crop_size=1200,
     )
+    index = random.randint(0, len(dataset) - 1)
 
-    subset_indices = [0]
+    subset_indices = [index]
     subset = data.Subset(dataset, subset_indices)
 
     #load dataset

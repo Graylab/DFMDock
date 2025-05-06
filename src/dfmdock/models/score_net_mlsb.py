@@ -15,7 +15,6 @@ class ModelConfig:
     lm_embed_dim: int
     positional_embed_dim: int
     spatial_embed_dim: int
-    contact_embed_dim: int
     node_dim: int
     edge_dim: int
     inner_dim: int
@@ -502,7 +501,6 @@ if __name__ == '__main__':
         lm_embed_dim=1280,
         positional_embed_dim=68,
         spatial_embed_dim=100,
-        contact_embed_dim=1,
         node_dim=24,
         edge_dim=12,
         inner_dim=24,
@@ -516,7 +514,6 @@ if __name__ == '__main__':
     rec_pos = torch.randn(40, 3, 3)
     lig_pos = torch.randn(5, 3, 3)
     t = torch.tensor([0.5])
-    contact_matrix = torch.zeros(45, 45)
     position_matrix = torch.zeros(45, 45, 68)
 
     batch = {
@@ -525,7 +522,6 @@ if __name__ == '__main__':
         "rec_pos": rec_pos,
         "lig_pos": lig_pos,
         "t": t,
-        "contact_matrix": contact_matrix,
         "position_matrix": position_matrix,
     }
 

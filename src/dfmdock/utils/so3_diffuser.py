@@ -5,6 +5,7 @@ import numpy as np
 import os
 import logging
 import torch
+import math
 from scipy.spatial.transform import Rotation
 
 #----------------------------------------------------------------------------
@@ -217,6 +218,15 @@ class SO3Diffuser:
             return self.min_sigma * (self.max_sigma / self.min_sigma) ** t
         else:
             raise ValueError(f'Unrecognize schedule {self.schedule}')
+    
+    def torch_sigma(self, t):
+        """Extract \sigma(t) corresponding to chosen sigma schedule."""
+        if self.schedule == 'logarithmic':
+            return torch.log(t * math.exp(self.max_sigma) + (1 - t) * math.exp(self.min_sigma))
+        elif self.schedule == 'VE':
+            return self.min_sigma * (self.max_sigma / self.min_sigma) ** t
+        else:
+            raise ValueError(f'Unrecognize schedule {self.schedule}')
 
     def diffusion_coef(self, t):
         """Compute diffusion coefficient (g_t)."""
@@ -365,11 +375,30 @@ class SO3Diffuser:
         """
         if not np.isscalar(t): raise ValueError(f'{t} must be a scalar.')
         g_t = self.diffusion_coef(t)
+        #g_t = np.clip(g_t, a_min=None, a_max=10.0) # clamp g_t
+        
         if not ode:
             z = noise_scale * torch.randn(1, 3, device=score_t.device)
             perturb = (g_t ** 2) * score_t * dt + g_t * torch.sqrt(dt) * z
         else:
             perturb = 0.5 * (g_t ** 2) * score_t * dt
+        return perturb.float()
+
+    def torch_reverse_langevin(
+            self,
+            score_t: torch.tensor,
+            dt: torch.tensor,
+            t: float,
+            noise_scale: float=1.0,
+            ode: bool=False,
+        ):
+        if not np.isscalar(t): raise ValueError(f'{t} must be a scalar.')
+        
+        if not ode:
+            z = noise_scale * torch.randn(1, 3, device=score_t.device)
+            perturb = 0.5 * score_t * dt + torch.sqrt(dt) * z
+        else:
+            perturb = 0.5 * score_t * dt
         return perturb.float()
 
     def torch_corrector(

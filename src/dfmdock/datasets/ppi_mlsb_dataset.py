@@ -17,6 +17,7 @@ from torch.utils.data import DataLoader, Dataset, DistributedSampler, WeightedRa
 from scipy.spatial.transform import Rotation 
 from dfmdock.utils import residue_constants
 from pinder.core.index.utils import get_index
+from pinder.data.plot.performance import get_subsampled_train
 
 #----------------------------------------------------------------------------
 # Helper functions
@@ -360,15 +361,23 @@ class PPIDataset(Dataset):
             self.data_list = "/scratch4/jgray21/lchu11/data/dips/data_list/diffdock-pp/val.txt" 
 
         elif dataset == 'dips_train_hetero':
-            self.data_dir = "/scratch4/jgray21/lchu11/data/pt/dips_bb"
+            self.data_dir = "/scratch4/jgray21/lchu11/data/dips/pt_clean"
             self.data_list = "/scratch4/jgray21/lchu11/data/dips/data_list/diffdock-pp/dips_train_hetero.txt" 
 
+        elif dataset == 'dips_train_hetero_sub':
+            self.data_dir = "/scratch4/jgray21/lchu11/data/dips/pt_clean"
+            self.data_list = "/scratch4/jgray21/lchu11/data/dips/data_list/diffdock-pp/dips_train_hetero_sub.txt" 
+
         elif dataset == 'dips_val_hetero':
-            self.data_dir = "/scratch4/jgray21/lchu11/data/pt/dips_bb"
+            self.data_dir = "/scratch4/jgray21/lchu11/data/dips/pt_clean"
             self.data_list = "/scratch4/jgray21/lchu11/data/dips/data_list/diffdock-pp/dips_val_hetero.txt" 
 
+        elif dataset == 'dips_val_hetero_sub':
+            self.data_dir = "/scratch4/jgray21/lchu11/data/dips/pt_clean"
+            self.data_list = "/scratch4/jgray21/lchu11/data/dips/data_list/diffdock-pp/dips_val_hetero_sub.txt" 
+
         elif dataset == 'dips_single':
-            self.data_dir = "/scratch4/jgray21/lchu11/data/pt/dips_bb"
+            self.data_dir = "/scratch4/jgray21/lchu11/data/dips/pt_clean"
             self.data_list = "/scratch4/jgray21/lchu11/data/dips/data_list/diffdock-pp/dips_single.txt" 
 
         elif dataset == 'pinder_train':
@@ -383,8 +392,24 @@ class PPIDataset(Dataset):
             if self.use_esm:
                 self.h5f = h5py.File('/scratch16/jgray21/lchu11/data/h5_files/pinder_combined.h5', 'r')
 
-        # Testing sets
+        elif dataset == 'pinder_train_sub':
+            self.data_dir = "/scratch4/jgray21/lchu11/data/pinder/train"
+            with open("/scratch4/jgray21/lchu11/graylab_repos/DFMDock/src/dfmdock/data/pinder_train/pinder_train_sub.txt", 'r') as f:
+                lines = f.readlines()
+            self.file_list = [line.strip() for line in lines] 
 
+            if self.use_esm:
+                self.h5f = h5py.File('/scratch16/jgray21/lchu11/data/h5_files/pinder_combined.h5', 'r')
+
+        elif dataset == 'db5_train_bound':
+            self.data_dir = "/scratch4/jgray21/lchu11/data/pt/db5_bound"
+            self.data_list = "/scratch4/jgray21/lchu11/data/db5/train_bound.txt"
+
+        elif dataset == 'db5_val_bound':
+            self.data_dir = "/scratch4/jgray21/lchu11/data/pt/db5_bound"
+            self.data_list = "/scratch4/jgray21/lchu11/data/db5/val_bound.txt"
+
+        # Testing sets
         elif dataset == 'dips_test':
             self.data_dir = "/scratch4/jgray21/lchu11/data/pt/dips_test"
             self.data_list = "/scratch4/jgray21/lchu11/data/dips/data_list/geodock/test.txt" 
@@ -393,9 +418,9 @@ class PPIDataset(Dataset):
             self.data_dir = "/scratch4/jgray21/lchu11/data/pt/db5_bound"
             self.data_list = "/scratch4/jgray21/lchu11/data/db5/test_bound.txt"
             
-        elif dataset == 'db5_bound':
+        elif dataset == 'db5_all':
             self.data_dir = "/scratch4/jgray21/lchu11/data/pt/db5_bound"
-            self.data_list = "/scratch4/jgray21/lchu11/data/db5/bound.txt"
+            self.data_list = "/scratch4/jgray21/lchu11/data/db5/test.txt"
 
         elif dataset == 'db5_ab_ag':
             self.data_dir = "/scratch4/jgray21/lchu11/data/pt/db5_bound"
@@ -409,6 +434,20 @@ class PPIDataset(Dataset):
             pindex = get_index()
             self.data_dir = "/scratch4/jgray21/lchu11/data/pinder/test" 
             self.file_list = list(pindex.query('pinder_s == True').id)
+            if self.use_esm:
+                self.h5f = h5py.File('/scratch16/jgray21/lchu11/data/h5_files/pinder_combined.h5', 'r')
+
+        elif dataset == 'pinder_af2':
+            pindex = get_index()
+            self.data_dir = "/scratch4/jgray21/lchu11/data/pinder/test" 
+            self.file_list = list(pindex.query('pinder_af2 == True').id)
+            if self.use_esm:
+                self.h5f = h5py.File('/scratch16/jgray21/lchu11/data/h5_files/pinder_combined.h5', 'r')
+
+        elif dataset == 'pinder_xl':
+            pindex = get_index()
+            self.data_dir = "/scratch4/jgray21/lchu11/data/pinder/test" 
+            self.file_list = list(pindex.query('pinder_xl == True').id)
             if self.use_esm:
                 self.h5f = h5py.File('/scratch16/jgray21/lchu11/data/h5_files/pinder_combined.h5', 'r')
 
@@ -475,14 +514,6 @@ class PPIDataset(Dataset):
             rec_x = rec_onehot
             lig_x = lig_onehot
         
-        # Additional embeddings
-        #rec_dihedrals = get_dihedrals(rec_pos)
-        #rec_orientations = get_orientations(rec_pos[..., 1, :])
-        #rec_sidechains = get_sidechains(rec_pos)
-        #print(rec_dihedrals.shape)
-        #print(rec_orientations.shape)
-        #print(rec_sidechains.shape)
-
         # Shuffle and Crop for training
         if self.training:
             # Shuffle the order of rec and lig
@@ -494,14 +525,17 @@ class PPIDataset(Dataset):
             # Crop to crop_size
             rec_x, lig_x, rec_pos, lig_pos, res_id, asym_id= self.crop_to_size(rec_x, lig_x, rec_seq, lig_seq, rec_pos, lig_pos)  
         else:
+            # make the smaller one ligand
+            vars_list = [(rec_x, rec_seq, rec_pos), (lig_x, lig_seq, lig_pos)]
+            if len(rec_x) < len(lig_x):
+                rec_x, rec_seq, rec_pos = vars_list[1]
+                lig_x, lig_seq, lig_pos = vars_list[0]
+
             # get res_id and asym_id
             n = rec_x.size(0) + lig_x.size(0)
             res_id = torch.arange(n).long()
             asym_id = torch.zeros(n).long()
             asym_id[rec_x.size(0):] = 1
-            entity_id = torch.zeros(n).long()
-            if rec_seq != lig_seq:
-                entity_id[rec_x.size(0):] = 1
 
         # Positional embeddings
         position_matrix = relpos(res_id, asym_id)
@@ -516,7 +550,7 @@ class PPIDataset(Dataset):
 
         # Interface residues
         rec_ires, lig_ires = get_interface_residue_tensors(rec_pos[..., 1, :], lig_pos[..., 1, :])
-        ires = torch.cat([rec_ires, lig_ires], dim=0) 
+        ires = torch.cat([rec_ires, lig_ires], dim=0)
 
         # Output
         output = {
@@ -545,8 +579,8 @@ class PPIDataset(Dataset):
         x = torch.cat([rec_x, lig_x], dim=0)
         pos = torch.cat([rec_pos, lig_pos], dim=0)
 
-        #use_spatial_crop = random.random() < 0.5
-        use_spatial_crop = True
+        use_spatial_crop = random.random() < 0.5
+        #use_spatial_crop = True
         num_res = asym_id.size(0)
 
         if num_res <= self.crop_size:
@@ -619,82 +653,6 @@ class PPIDataModule(pl.LightningDataModule):
             pin_memory=self.pin_memory,
             sampler=sampler,
             shuffle=False,
-            #shuffle=(sampler is None),
-        )
-
-    def val_dataloader(self):
-        return DataLoader(
-            dataset=self.data_val,
-            batch_size=self.batch_size,
-            num_workers=self.num_workers,
-            pin_memory=self.pin_memory,
-            shuffle=False,
-        )
-
-class InterfaceDataModule(pl.LightningDataModule):
-    def __init__(
-        self,
-        train_dataset: str,
-        val_dataset: str,
-        csv_path: str,
-        use_esm: bool = True,
-        crop_size: int = 1200,
-        batch_size: int = 1,
-        **kwargs
-    ):
-        super().__init__()
-        self.train_dataset = train_dataset
-        self.val_dataset = val_dataset
-        self.csv_path = csv_path
-        self.use_esm = use_esm
-        self.crop_size = crop_size
-        self.batch_size = batch_size
-        self.num_workers = kwargs['num_workers']
-        self.pin_memory = kwargs['pin_memory']
-
-        self.data_train: Optional[Dataset] = None
-        self.data_val: Optional[Dataset] = None
-    
-    def prepare_data(self):
-        pass
-
-    def setup(self, stage: Optional[str] = None):
-        df = pd.read_csv(self.csv_path)
-        df["prob"] = 1 / df["interface_cluster_size"]
-        df["prob"] /= df["prob"].sum()
-
-        self.sampling_probs = torch.tensor(df["prob"])
-
-        # Convert to dictionary for fast lookup
-        self.sampling_prob_dict = df.set_index("interface_id")["prob"].to_dict()
-
-        self.interface_ids = df["interface_id"].values
-
-        self.data_train = PPIDataset(
-            dataset=self.train_dataset, 
-            use_esm=self.use_esm,
-            crop_size=self.crop_size,
-        )
-        self.data_val = PPIDataset(
-            dataset=self.val_dataset, 
-            use_esm=self.use_esm,
-            crop_size=self.crop_size,
-        )
-    
-    def get_sampling_probs(self):
-        """Lookup sampling probabilities for each interface_id in dataset"""
-        return torch.tensor([self.sampling_prob_dict[i] for i in self.interface_ids], dtype=torch.float)
-
-    def train_dataloader(self):
-        sampling_probs = self.get_sampling_probs()
-        sampler = WeightedRandomSampler(weights=sampling_probs, num_samples=len(self.data_train), replacement=True)
-        return DataLoader(
-            dataset=self.data_train,
-            batch_size=self.batch_size,
-            num_workers=self.num_workers,
-            pin_memory=self.pin_memory,
-            sampler=sampler,
-            shuffle=(sampler is None),
         )
 
     def val_dataloader(self):
@@ -712,27 +670,7 @@ class InterfaceDataModule(pl.LightningDataModule):
 
 if __name__ == '__main__':
     dataset = PPIDataset(
-        dataset="pinder_train",
+        dataset="db5_test",
     )
-    dataset[0]
-    #print(dataset[0])
-        
-    
-    """
-    datamodule = InterfaceDataModule(
-        csv_path="/scratch4/jgray21/lchu11/graylab_repos/DFMDock/src/dfmdock/data/pinder_train/interface_cluster_sizes.csv",
-        train_dataset="pinder_train",
-        val_dataset="pinder_val",
-        batch_size=1,
-        num_workers=1,
-        pin_memory=False,
-    )
-    datamodule.setup()
-
-    # Get a train batch
-    train_loader = datamodule.train_dataloader()
-    print(len(train_loader))
-    for batch in train_loader:
-        print("Sampled Batch:", batch)
-        break  # Show one batch
-    """
+    print(len(dataset))
+    print(dataset[0])

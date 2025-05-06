@@ -4,7 +4,7 @@ import torch.nn.functional as F
 import numpy as np
 from dataclasses import dataclass
 from einops import repeat
-from dfmdock.models.egnn_model import E_GCL
+from dfmdock.models.egnn import E_GCL
 from dfmdock.utils.coords6d import get_coords6d
 
 #----------------------------------------------------------------------------
@@ -25,25 +25,6 @@ class ModelConfig:
 
 #----------------------------------------------------------------------------
 # Helper functions
-
-def smooth_decay(dij):
-    return torch.exp(-(dij - 10).clamp(min=0))  # Exponential decay beyond 10Å
-
-
-def interaction_mask(d_ij, cutoff_distance=10.0, exponent=2):
-    # Apply decay for long-range interactions
-    decay_weight = (cutoff_distance / d_ij).clamp(max=1.0) ** exponent  # Decay factor
-    mask = torch.where(d_ij > cutoff_distance, decay_weight, torch.ones_like(d_ij))  # Apply decay
-    return mask
-
-
-def get_clash_energy(x_receptor, x_ligand, x0=3.0, p=1.5, w_rep=5):
-    """ Assign higher energy to steric clashes using an exponential penalty """
-    x = torch.cdist(x_receptor, x_ligand)  # Compute pairwise distances
-    mask = (x < x0).float()
-    rep = torch.where(x < x0, (torch.abs(x0 - x) ** p) / (p * x * (p - 1)), torch.tensor(0.0, device=x.device))
-    return rep 
-
 
 def get_spatial_matrix(coord):
     dist, omega, theta, phi = get_coords6d(coord)
@@ -307,30 +288,6 @@ class EGNN(nn.Module):
         return h, x, edge_attr
 
 
-class InteractionEnergy(nn.Module):
-    def __init__(self, dim):
-        super().__init__()
-        
-        # MLPs for repulsion and attraction
-        self.mlp_rep = nn.Sequential(nn.Linear(dim * 2, dim), nn.SiLU(), nn.Linear(dim, 1))
-        self.mlp_atr = nn.Sequential(nn.Linear(dim * 2, dim), nn.SiLU(), nn.Linear(dim, 1))
-    
-    def forward(self, hi, hj, dij):
-        x = torch.cat([hi, hj], dim=-1)
-
-        # Repulsion: active only for d < 3
-        mask_rep = (dij < 3).float()
-        g_rep = F.softplus(self.mlp_rep(x)).squeeze(-1)
-
-        # Attraction: smoothly decays beyond 10
-        mask_atr = (dij < 10).float() + smooth_decay(dij)
-        g_atr = self.mlp_atr(x).squeeze(-1)
-
-        # Compute interaction energy
-        Eij = mask_rep * g_rep + mask_atr * g_atr
-        return Eij
-
-
 #----------------------------------------------------------------------------
 # Main score network
 
@@ -374,7 +331,13 @@ class Score_Net(nn.Module):
         )
 
         # energy head
-        self.to_energy = InteractionEnergy(dim=node_dim)
+        self.to_energy = nn.Sequential(
+            nn.Linear(2*node_dim + 1, node_dim, bias=False),
+            nn.LayerNorm(node_dim),
+            nn.SiLU(),
+            nn.Dropout(dropout),
+            nn.Linear(node_dim, 1, bias=False),
+        )
 
         # interface residue head
         self.to_ires = nn.Sequential(
@@ -382,6 +345,7 @@ class Score_Net(nn.Module):
             nn.SiLU(),
             nn.Linear(2*node_dim, 2*node_dim),
             nn.SiLU(),
+            nn.Dropout(dropout),
             nn.Linear(2*node_dim, 1),
         )
 
@@ -395,17 +359,21 @@ class Score_Net(nn.Module):
         # tr_scale mlp
         self.tr_scale = nn.Sequential(
             nn.Linear(inner_dim + 1, inner_dim, bias=False),
+            nn.LayerNorm(inner_dim),
             nn.SiLU(),
+            nn.Dropout(dropout),
             nn.Linear(inner_dim, 1, bias=False),
-            nn.Softplus(),
+            nn.Softplus()
         )
 
         # rot_scale mlp
         self.rot_scale = nn.Sequential(
             nn.Linear(inner_dim + 1, inner_dim, bias=False),
+            nn.LayerNorm(inner_dim),
             nn.SiLU(),
+            nn.Dropout(dropout),
             nn.Linear(inner_dim, 1, bias=False),
-            nn.Softplus(),
+            nn.Softplus()
         )
 
         self.apply(self._init_weights)
@@ -434,8 +402,7 @@ class Score_Net(nn.Module):
         lig_pos = lig_pos - center
 
         # get ca distance matrix 
-        d_ij = torch.norm((rec_pos[:, None, 1, :] - lig_pos[None, :, 1, :]), dim=-1)
-        clash_energy = get_clash_energy(rec_pos[..., 1, :], lig_pos[..., 1, :])
+        d_ij = torch.norm((rec_pos[:, None, 1, :] - lig_pos[None, :, 1, :]), dim=-1, keepdim=True)
 
         # get the current complex pose
         lig_pos.requires_grad_()
@@ -443,7 +410,7 @@ class Score_Net(nn.Module):
 
         # node feature embedding
         x = torch.cat([rec_x, lig_x], dim=0)
-        node = self.single_embed(x) # [n, c]
+        node = self.single_embed(x) 
 
         # edge feature embedding
         spatial_matrix = get_spatial_matrix(pos)
@@ -457,7 +424,7 @@ class Score_Net(nn.Module):
         lig_mask[rec_x.size(0):] = 1.0
 
         # main network 
-        node_out, pos_out, _ = self.network(node, pos[..., 1, :], edge_index, edge_attr, lig_mask) # [R+L, H]
+        node_out, pos_out, _ = self.network(node, pos[..., 1, :], edge_index, edge_attr, lig_mask) 
 
         # interface residue
         ires = self.to_ires(node_out)
@@ -465,8 +432,9 @@ class Score_Net(nn.Module):
         # energy
         h_rec = repeat(node_out[:rec_pos.size(0)], 'n h -> n m h', m=lig_pos.size(0))
         h_lig = repeat(node_out[rec_pos.size(0):], 'm h -> n m h', n=rec_pos.size(0))
-        energy = self.to_energy(h_rec, h_lig, d_ij)
-        energy = energy.sum()
+        energy = self.to_energy(torch.cat([h_rec, h_lig, d_ij], dim=-1))
+        mask_2D = (d_ij < self.cut_off).float()
+        energy = (energy * mask_2D).sum()
 
         if return_energy:
             return energy
@@ -474,7 +442,7 @@ class Score_Net(nn.Module):
         # force
         lig_pos_curr = pos_out[rec_pos.size(0):] 
         r = lig_pos[..., 1, :].detach()
-        f = lig_pos_curr - r # f / kT
+        f = lig_pos_curr - r 
 
         # translation
         tr_pred = f.sum(dim=0, keepdim=True)
@@ -511,7 +479,7 @@ class Score_Net(nn.Module):
             allow_unused=True,
         )[0]
 
-        dedx = -dedx[..., 1, :] # F / kT
+        dedx = -dedx[..., 1, :] 
         
         outputs = {
             "tr_score": tr_score,

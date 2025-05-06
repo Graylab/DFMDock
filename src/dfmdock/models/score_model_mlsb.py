@@ -13,7 +13,6 @@ from dfmdock.models.score_net_mlsb import Score_Net
 from dfmdock.utils.so3_diffuser import SO3Diffuser 
 from dfmdock.utils.r3_diffuser import R3Diffuser 
 from dfmdock.utils.geometry import axis_angle_to_matrix
-from dfmdock.utils.dockq import get_DockQ
 from dfmdock.datasets.ppi_mlsb_dataset import PPIDataset
 
 #----------------------------------------------------------------------------
@@ -62,6 +61,10 @@ class Score_Model(pl.LightningModule):
     def forward(self, batch):
         outputs = self.net(batch, predict=True)
         return outputs
+        
+    def get_energy(self, batch):
+        energy = self.net(batch, return_energy=True)
+        return energy
 
     def loss_fn(self, batch, eps=1e-5):
         with torch.no_grad():
@@ -94,9 +97,6 @@ class Score_Model(pl.LightningModule):
             # update poses          
             batch["lig_pos"] = self.modify_coords(batch["lig_pos"], rot_update, tr_update)
 
-            # get dockq
-            #dockq = get_DockQ((batch["rec_pos"], batch["lig_pos"]), (batch_gt["rec_pos"], batch_gt["lig_pos"]))
-        
         # predict score based on the current state
         if self.grad_energy:
             outputs = self.net(batch)

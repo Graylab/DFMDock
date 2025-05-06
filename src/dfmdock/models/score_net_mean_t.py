@@ -4,7 +4,7 @@ import torch.nn.functional as F
 import numpy as np
 from dataclasses import dataclass
 from einops import repeat
-from dfmdock.models.egnn_model import E_GCL
+from dfmdock.models.egnn import E_GCL
 from dfmdock.utils.coords6d import get_coords6d
 
 #----------------------------------------------------------------------------
@@ -26,42 +26,16 @@ class ModelConfig:
 #----------------------------------------------------------------------------
 # Helper functions
 
-def get_rotat(coords):
-    # Get backbone coordinates. 
-    n_coords = coords[:, 0, :]
-    ca_coords = coords[:, 1, :]
-    c_coords = coords[:, 2, :]
-
-    # Gram-Schmidt process.
-    v1 = c_coords - ca_coords 
-    v2 = n_coords - ca_coords
-    e1 = F.normalize(v1) 
-    u2 = v2 - e1 * (torch.einsum('b i, b i -> b', e1, v2).unsqueeze(-1))
-    e2 = F.normalize(u2) 
-    e3 = torch.cross(e1, e2, dim=-1)
-
-    # Get rotations.
-    rotations=torch.stack([e1, e2, e3], dim=-1)
-    return rotations
-
-def get_clash_energy(x_receptor, x_ligand, x0=3.0, p=1.5, w_rep=5):
-    """ Assign higher energy to steric clashes using an exponential penalty """
-    x = torch.cdist(x_receptor, x_ligand)  # Compute pairwise distances
-    mask = (x < x0).float()
-    rep = torch.where(x < x0, (torch.abs(x0 - x) ** p) / (p * x0 ** (p - 1)), torch.tensor(0.0, device=x.device))
-    return (rep * mask).sum()
-
-
-def get_spatial_matrix(coord, cut_off=20.0):
+def get_spatial_matrix(coord):
     dist, omega, theta, phi = get_coords6d(coord)
 
-    mask = dist < cut_off
+    mask = dist < 22.0
     
     num_dist_bins = 40
     num_omega_bins = 24
     num_theta_bins = 24
     num_phi_bins = 12
-    dist_bin = get_bins(dist, 3.0, cut_off, num_dist_bins)
+    dist_bin = get_bins(dist, 3.25, 50.75, num_dist_bins)
     omega_bin = get_bins(omega, -180.0, 180.0, num_omega_bins)
     theta_bin = get_bins(theta, -180.0, 180.0, num_theta_bins)
     phi_bin = get_bins(phi, 0.0, 180.0, num_phi_bins)
@@ -338,6 +312,7 @@ class Score_Net(nn.Module):
         
         # single init embedding
         self.single_embed = nn.Linear(lm_embed_dim, node_dim, bias=False)
+        self.single_t_embed = GaussianFourierProjection(embed_dim=node_dim)
 
         # pair init embedding
         self.spatial_embed = nn.Linear(spatial_embed_dim, edge_dim, bias=False)
@@ -358,7 +333,7 @@ class Score_Net(nn.Module):
 
         # energy head
         self.to_energy = nn.Sequential(
-            nn.Linear(2*node_dim + 1, node_dim, bias=False),
+            nn.Linear(2*node_dim, node_dim, bias=False),
             nn.LayerNorm(node_dim),
             nn.SiLU(),
             nn.Linear(node_dim, 1, bias=False),
@@ -366,14 +341,19 @@ class Score_Net(nn.Module):
 
         # interface residue head
         self.to_ires = nn.Sequential(
-            nn.Linear(node_dim, node_dim, bias=False),
-            nn.LayerNorm(node_dim),
+            nn.Linear(node_dim, 2*node_dim),
             nn.SiLU(),
-            nn.Linear(node_dim, 1, bias=False),
+            nn.Linear(2*node_dim, 2*node_dim),
+            nn.SiLU(),
+            nn.Linear(2*node_dim, 1),
         )
 
         # timestep embedding
-        self.t_embed = GaussianFourierProjection(embed_dim=inner_dim)
+        self.t_embed = nn.Sequential(
+            GaussianFourierProjection(embed_dim=inner_dim),
+            nn.Linear(inner_dim, inner_dim, bias=False),
+            nn.Sigmoid(),
+        )
 
         # tr_scale mlp
         self.tr_scale = nn.Sequential(
@@ -381,7 +361,7 @@ class Score_Net(nn.Module):
             nn.LayerNorm(inner_dim),
             nn.SiLU(),
             nn.Linear(inner_dim, 1, bias=False),
-            nn.Softplus(),
+            nn.Softplus()
         )
 
         # rot_scale mlp
@@ -390,7 +370,7 @@ class Score_Net(nn.Module):
             nn.LayerNorm(inner_dim),
             nn.SiLU(),
             nn.Linear(inner_dim, 1, bias=False),
-            nn.Softplus(),
+            nn.Softplus()
         )
 
         self.apply(self._init_weights)
@@ -417,19 +397,20 @@ class Score_Net(nn.Module):
         rec_pos = rec_pos - center
         lig_pos = lig_pos - center
 
-        # get ca distance matrix 
-        d_ij = torch.norm((rec_pos[:, None, 1, :] - lig_pos[None, :, 1, :]), dim=-1)
-
         # get the current complex pose
         lig_pos.requires_grad_()
         pos = torch.cat([rec_pos, lig_pos], dim=0)
 
+        # get ca distance matrix 
+        D = torch.norm((rec_pos[:, None, 1, :] - lig_pos[None, :, 1, :]), dim=-1)
+
         # node feature embedding
         x = torch.cat([rec_x, lig_x], dim=0)
-        node = self.single_embed(x) # [n, c]
+        node = self.single_embed(x)
+        node = node + self.single_t_embed(batch["t"])
 
         # edge feature embedding
-        spatial_matrix = get_spatial_matrix(pos, cut_off=self.cut_off)
+        spatial_matrix = get_spatial_matrix(pos)
         edge = self.spatial_embed(spatial_matrix) + self.positional_embed(position_matrix)
 
         # sample edge_index and get edge_attr
@@ -440,7 +421,7 @@ class Score_Net(nn.Module):
         lig_mask[rec_x.size(0):] = 1.0
 
         # main network 
-        node_out, pos_out, _ = self.network(node, pos[..., 1, :], edge_index, edge_attr, lig_mask) # [R+L, H]
+        node_out, pos_out, _ = self.network(node, pos[..., 1, :], edge_index, edge_attr, lig_mask)
 
         # interface residue
         ires = self.to_ires(node_out)
@@ -448,9 +429,9 @@ class Score_Net(nn.Module):
         # energy
         h_rec = repeat(node_out[:rec_pos.size(0)], 'n h -> n m h', m=lig_pos.size(0))
         h_lig = repeat(node_out[rec_pos.size(0):], 'm h -> n m h', n=rec_pos.size(0))
-        energy = self.to_energy(torch.cat([h_rec, h_lig, d_ij.unsqueeze(-1)], dim=-1)).squeeze(-1) 
-        mask_2D = (d_ij < self.cut_off).float() 
-        energy = (energy * mask_2D).sum() 
+        energy = self.to_energy(torch.cat([h_rec, h_lig], dim=-1)).squeeze(-1)
+        mask_2D = (D < self.cut_off).float()
+        energy = (energy * mask_2D).sum() / (mask_2D.sum() + 1e-6) 
 
         if return_energy:
             return energy
@@ -458,13 +439,13 @@ class Score_Net(nn.Module):
         # force
         lig_pos_curr = pos_out[rec_pos.size(0):] 
         r = lig_pos[..., 1, :].detach()
-        f = lig_pos_curr - r # f / kT
+        f = lig_pos_curr - r
 
         # translation
-        tr_pred = f.sum(dim=0, keepdim=True)
+        tr_pred = f.mean(dim=0, keepdim=True)
 
         # rotation
-        rot_pred = torch.cross(r, f, dim=-1).sum(dim=0, keepdim=True)
+        rot_pred = torch.cross(r, f, dim=-1).mean(dim=0, keepdim=True)
 
         # scale
         t = self.t_embed(batch["t"])
@@ -474,14 +455,11 @@ class Score_Net(nn.Module):
         rot_score = rot_pred / (rot_norm + 1e-6) * self.rot_scale(torch.cat([rot_norm, t], dim=-1))
 
         if predict:
-            num_clashes = get_clashes(d_ij)
-
             outputs = {
                 "tr_score": tr_score,
                 "rot_score": rot_score,
                 "energy": energy,
                 "f": f,
-                "num_clashes": num_clashes,
                 "ires": ires,
             }
 

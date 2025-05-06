@@ -4,7 +4,7 @@ import torch.nn.functional as F
 import numpy as np
 from dataclasses import dataclass
 from einops import repeat
-from dfmdock.models.egnn_model import E_GCL
+from dfmdock.models.egnn import E_GCL
 from dfmdock.utils.coords6d import get_coords6d
 
 #----------------------------------------------------------------------------
@@ -15,7 +15,6 @@ class ModelConfig:
     lm_embed_dim: int
     positional_embed_dim: int
     spatial_embed_dim: int
-    contact_embed_dim: int
     node_dim: int
     edge_dim: int
     inner_dim: int
@@ -289,14 +288,6 @@ class EGNN(nn.Module):
         return h, x, edge_attr
 
 
-class ConfidenceModel(nn.Module):
-    def __init__(self):
-        super().__init__()
-        self.beta = nn.Parameter(torch.tensor(1.0))  # Learnable parameter
-
-    def forward(self, E):
-        return torch.sigmoid(-self.beta * E)  # Confidence = sigmoid(-βE)
-
 #----------------------------------------------------------------------------
 # Main score network
 
@@ -321,6 +312,7 @@ class Score_Net(nn.Module):
         
         # single init embedding
         self.single_embed = nn.Linear(lm_embed_dim, node_dim, bias=False)
+        self.single_t_embed = GaussianFourierProjection(embed_dim=node_dim)
 
         # pair init embedding
         self.spatial_embed = nn.Linear(spatial_embed_dim, edge_dim, bias=False)
@@ -346,12 +338,6 @@ class Score_Net(nn.Module):
             nn.SiLU(),
             nn.Linear(node_dim, 1, bias=False),
         )
-
-        # confidence head
-        self.to_confidence = ConfidenceModel()
-
-        # zij head
-        self.to_zij = nn.Linear(node_dim, 1, bias=False)
 
         # interface residue head
         self.to_ires = nn.Sequential(
@@ -404,7 +390,6 @@ class Score_Net(nn.Module):
         lig_x = batch["lig_x"] 
         rec_pos = batch["rec_pos"] 
         lig_pos = batch["lig_pos"] 
-        t = batch["t"]
         position_matrix = batch["position_matrix"]
 
         # move to center
@@ -421,7 +406,8 @@ class Score_Net(nn.Module):
 
         # node feature embedding
         x = torch.cat([rec_x, lig_x], dim=0)
-        node = self.single_embed(x) 
+        node = self.single_embed(x)
+        node = node + self.single_t_embed(batch["t"])
 
         # edge feature embedding
         spatial_matrix = get_spatial_matrix(pos)
@@ -435,7 +421,7 @@ class Score_Net(nn.Module):
         lig_mask[rec_x.size(0):] = 1.0
 
         # main network 
-        node_out, pos_out, _ = self.network(node, pos[..., 1, :], edge_index, edge_attr, lig_mask) 
+        node_out, pos_out, _ = self.network(node, pos[..., 1, :], edge_index, edge_attr, lig_mask)
 
         # interface residue
         ires = self.to_ires(node_out)
@@ -443,38 +429,26 @@ class Score_Net(nn.Module):
         # energy
         h_rec = repeat(node_out[:rec_pos.size(0)], 'n h -> n m h', m=lig_pos.size(0))
         h_lig = repeat(node_out[rec_pos.size(0):], 'm h -> n m h', n=rec_pos.size(0))
-        interactions = torch.cat([h_rec, h_lig], dim=-1)
-        energy = self.to_energy(interactions).squeeze(-1) # [R, L]
-        mask_2D = (D < self.cut_off).float() # [R, L]
-        energy = (energy * mask_2D).sum() / (mask_2D.sum() + 1e-6)
-
-        # confidence
-        confidence = self.to_confidence(energy)
-
-        # zij
-        zij = self.to_zij(h_rec * h_lig).squeeze(-1)
+        energy = self.to_energy(torch.cat([h_rec, h_lig], dim=-1)).squeeze(-1)
+        mask_2D = (D < self.cut_off).float()
+        energy = (energy * mask_2D).sum() 
 
         if return_energy:
-            outputs = {
-                "energy": energy,
-                "confidence": confidence,
-                "zij": zij,
-            }
-            return outputs
+            return energy
 
         # force
         lig_pos_curr = pos_out[rec_pos.size(0):] 
         r = lig_pos[..., 1, :].detach()
-        f = lig_pos_curr - r # f / kT
+        f = lig_pos_curr - r
 
         # translation
-        tr_pred = f.mean(dim=0, keepdim=True)
+        tr_pred = f.sum(dim=0, keepdim=True)
 
         # rotation
-        rot_pred = torch.cross(r, f, dim=-1).mean(dim=0, keepdim=True)
+        rot_pred = torch.cross(r, f, dim=-1).sum(dim=0, keepdim=True)
 
         # scale
-        t = self.t_embed(t)
+        t = self.t_embed(batch["t"])
         tr_norm = torch.linalg.vector_norm(tr_pred, keepdim=True)
         tr_score = tr_pred / (tr_norm + 1e-6) * self.tr_scale(torch.cat([tr_norm, t], dim=-1))
         rot_norm = torch.linalg.vector_norm(rot_pred, keepdim=True)
@@ -485,8 +459,6 @@ class Score_Net(nn.Module):
                 "tr_score": tr_score,
                 "rot_score": rot_score,
                 "energy": energy,
-                "confidence": confidence,
-                "zij": zij,
                 "f": f,
                 "ires": ires,
             }
@@ -510,8 +482,6 @@ class Score_Net(nn.Module):
             "tr_score": tr_score,
             "rot_score": rot_score,
             "energy": energy,
-            "confidence": confidence,
-            "zij": zij,
             "f": f,
             "dedx": dedx,
             "ires": ires,
@@ -527,7 +497,6 @@ if __name__ == '__main__':
         lm_embed_dim=1280,
         positional_embed_dim=68,
         spatial_embed_dim=100,
-        contact_embed_dim=1,
         node_dim=24,
         edge_dim=12,
         inner_dim=24,
@@ -541,7 +510,6 @@ if __name__ == '__main__':
     rec_pos = torch.randn(40, 3, 3)
     lig_pos = torch.randn(5, 3, 3)
     t = torch.tensor([0.5])
-    contact_matrix = torch.zeros(45, 45)
     position_matrix = torch.zeros(45, 45, 68)
 
     batch = {
@@ -550,7 +518,6 @@ if __name__ == '__main__':
         "rec_pos": rec_pos,
         "lig_pos": lig_pos,
         "t": t,
-        "contact_matrix": contact_matrix,
         "position_matrix": position_matrix,
     }
 

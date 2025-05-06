@@ -5,6 +5,7 @@ warnings.filterwarnings("ignore", category=FutureWarning)
 import os
 import csv
 import torch
+import torch.nn.functional as F
 import numpy as np
 import hydra
 import random
@@ -13,8 +14,8 @@ from dataclasses import dataclass
 from tqdm import tqdm
 from torch.utils import data
 from scipy.spatial.transform import Rotation 
-from dfmdock.models.score_model_tf import Score_Model
-from dfmdock.datasets.pp_docking_dataset import PPDockingDataset
+from dfmdock.models.score_model import Score_Model
+from dfmdock.datasets.ppi_mlsb_dataset import PPIDataset
 from dfmdock.utils.geometry import axis_angle_to_matrix, matrix_to_axis_angle
 from dfmdock.utils.pdb import save_PDB, place_fourth_atom 
 from dfmdock.utils.metrics import compute_metrics
@@ -119,7 +120,7 @@ class Sampler:
         self.model.to(self.device)
         
         # get testset
-        testset = PPDockingDataset(
+        testset = PPIDataset(
             dataset=self.data_conf.dataset, 
             training=False, 
             use_esm=self.data_conf.use_esm,
@@ -209,9 +210,25 @@ class Sampler:
             rec_pos = batch['rec_pos'].to(self.device).squeeze(0)
             lig_pos = batch['lig_pos'].to(self.device).squeeze(0)
             position_matrix = batch['position_matrix'].to(self.device).squeeze(0)
+            ires = batch['ires'].to(self.device).squeeze(0)
 
-            if rec_x.size(0) + lig_x.size(0) > 1000:
-                continue
+            # interface embedding
+            n = self.data_conf.num_ires
+
+            if n < 1:
+                sampled_ires = torch.zeros_like(ires)
+            elif n < 5:
+                indices = ires.nonzero(as_tuple=True)[0]
+                k = min(n, len(indices))
+                index = torch.randperm(len(indices))[:k]
+                sampled_indices = indices[index]
+                sampled_ires = torch.zeros_like(ires)
+                sampled_ires[sampled_indices] = 1.0
+            else:
+                sampled_ires = ires
+            
+            rec_x = torch.cat([rec_x, sampled_ires[:rec_x.size(0)]], dim=-1)
+            lig_x = torch.cat([lig_x, sampled_ires[rec_x.size(0):]], dim=-1)
 
             batch = {
                 "rec_x": rec_x,
@@ -231,13 +248,14 @@ class Sampler:
             )
 
             if self.data_conf.get_gt_energy:
-                batch["t"] = torch.zeros(1, device=self.device) + 1e-5
-                output = self.model(batch)
+                batch["t"] = torch.zeros(1, device=self.device)
+                batch["rec_pos"] = rec_pos.detach().clone()
+                batch["lig_pos"] = lig_pos.detach().clone()
+                energy = self.model.get_energy(batch).detach()
 
                 metrics = {'id': _id}
                 metrics.update(self.get_metrics([rec_pos, lig_pos], [rec_pos, lig_pos]))
-                metrics.update({'energy': output["energy"].item()})
-                #metrics.update({'num_clashes': output["num_clashes"].item()})
+                metrics.update({'energy': energy.item()})
                 metrics_list.append(metrics)
             
             else:
@@ -264,7 +282,6 @@ class Sampler:
                     metrics = {'id': _id, 'index': str(i)}
                     metrics.update(self.get_metrics([_rec_pos[-1], _lig_pos[-1]], [rec_pos, lig_pos]))
                     metrics.update({'energy': energy.item()})
-                    #metrics.update({'num_clashes': num_clashes.item()})
                     metrics_list.append(metrics)
 
                     if self.data_conf.out_trj:
@@ -288,7 +305,7 @@ class Sampler:
 
         # initialize time steps
         t = torch.ones(batch_size, device=self.device)
-        time_steps = torch.linspace(1., eps, self.data_conf.num_steps, device=self.device)
+        time_steps = torch.linspace(1., 0., self.data_conf.num_steps, device=self.device)
         dt = time_steps[0] - time_steps[1]
 
         # get initial pose
@@ -296,69 +313,73 @@ class Sampler:
         lig_pos = batch["lig_pos"] 
 
         # randomly initialize coordinates
-        rec_pos, lig_pos, rot_update, tr_update = self.randomize_pose(rec_pos, lig_pos)
+        if self.data_conf.randomize:
+            #rec_pos, lig_pos, rot_update, tr_update = self.randomize_pose(rec_pos, lig_pos)
+            rec_pos, lig_pos = self.initialize_ligand_far_from_receptor(rec_pos, lig_pos)
         
         # save initial coordinates 
         rec_trj.append(rec_pos)
         lig_trj.append(lig_pos)
 
         # run reverse sde 
-        for i, time_step in enumerate(tqdm((time_steps))):  
-            # get current time step 
-            is_last = i == time_steps.size(0) - 1   
-            t = torch.ones(batch_size, device=self.device) * time_step
+        with torch.no_grad():
+            for i, time_step in enumerate(tqdm((time_steps[:-1]))):  
+                # get current time step 
+                is_last = i == time_steps.size(0) - 2
+                t = torch.ones(batch_size, device=self.device) * time_step
 
-            batch["t"] = t
-            batch["rec_pos"] = rec_pos.detach().clone()
-            batch["lig_pos"] = lig_pos.detach().clone()
-
-            # get predictions
-            output = self.model(batch) 
-
-            if not is_last:
-                tr_noise_scale = self.data_conf.tr_noise_scale
-                rot_noise_scale = self.data_conf.rot_noise_scale
-            else:
-                tr_noise_scale = 0.0
-                rot_noise_scale = 0.0
-
-            if self.perturb_rot:
-                rot = self.model.so3_diffuser.torch_reverse(
-                    score_t=output["rot_score"].detach(),
-                    t=t.item(),
-                    dt=dt,
-                    noise_scale=rot_noise_scale,
-                    ode=ode,
-                )
-            else:
-                rot = torch.zeros((1, 3), device=self.device)
-
-            if self.perturb_tr:
-                tr = self.model.r3_diffuser.torch_reverse(
-                    score_t=output["tr_score"].detach(),
-                    t=t.item(),
-                    dt=dt,
-                    noise_scale=tr_noise_scale,
-                    ode=ode,
-                )
-            else:
-                tr = torch.zeros((1, 3), device=self.device)
-
-            lig_pos = self.modify_coords(lig_pos, rot, tr)
-
-            # clash
-            if self.data_conf.use_clash_force:
-                clash_force = self.clash_force(rec_pos.detach().clone(), lig_pos.detach().clone())
-                lig_pos = lig_pos + clash_force
-
-            if is_last:
+                batch["t"] = t
                 batch["rec_pos"] = rec_pos.detach().clone()
                 batch["lig_pos"] = lig_pos.detach().clone()
-                energy = self.model.get_energy(batch).detach()
 
-            # save coordinates
-            rec_trj.append(rec_pos)         
-            lig_trj.append(lig_pos)
+                # get predictions
+                output = self.model(batch) 
+
+                if not is_last:
+                    tr_noise_scale = self.data_conf.tr_noise_scale
+                    rot_noise_scale = self.data_conf.rot_noise_scale
+                else:
+                    tr_noise_scale = 0.0
+                    rot_noise_scale = 0.0
+
+                if self.perturb_rot:
+                    rot = self.model.so3_diffuser.torch_reverse(
+                        score_t=output["rot_score"].detach(),
+                        t=t.item(),
+                        dt=dt,
+                        noise_scale=rot_noise_scale,
+                        ode=ode,
+                    )
+                else:
+                    rot = torch.zeros((1, 3), device=self.device)
+
+                if self.perturb_tr:
+                    tr = self.model.r3_diffuser.torch_reverse(
+                        score_t=output["tr_score"].detach(),
+                        t=t.item(),
+                        dt=dt,
+                        noise_scale=tr_noise_scale,
+                        ode=ode,
+                    )
+                else:
+                    tr = torch.zeros((1, 3), device=self.device)
+
+                lig_pos = self.modify_coords(lig_pos, rot, tr)
+
+                # clash
+                if self.data_conf.use_clash_force:
+                    clash_force = self.clash_force(rec_pos.detach().clone(), lig_pos.detach().clone())
+                    lig_pos = lig_pos + clash_force
+
+                if is_last:
+                    batch["t"] = torch.zeros(batch_size, device=self.device)
+                    batch["rec_pos"] = rec_pos.detach().clone()
+                    batch["lig_pos"] = lig_pos.detach().clone()
+                    energy = self.model.get_energy(batch).detach()
+
+                # save coordinates
+                rec_trj.append(rec_pos)         
+                lig_trj.append(lig_pos)
                 
         return rec_trj, lig_trj, energy
 
@@ -390,6 +411,38 @@ class Sampler:
         rot_update = matrix_to_axis_angle(rot_update.unsqueeze(0))
 
         return x1, x2, rot_update, tr_update
+
+    def initialize_ligand_far_from_receptor(self, x1, x2, max_iter=1000, min_distance=8.0, step=1.0):
+        # get center of mass
+        c1 = torch.mean(x1[..., 1, :], dim=0)
+        c2 = torch.mean(x2[..., 1, :], dim=0)
+
+        # move to origin
+        x1 = x1 - c1
+        x2 = x2 - c2
+
+        # init rotation
+        if self.perturb_rot:
+            # get rotat update
+            rot_update = torch.from_numpy(Rotation.random().as_matrix()).float().to(self.device)
+            x2 = x2 @ rot_update.T
+
+        # init translation
+        if self.perturb_tr:
+            # Sample random unit direction
+            direction = F.normalize(torch.randn(1, 3, device=self.device))
+
+            # Move ligand until min distance is satisfied
+            distance = torch.tensor(step, device=self.device)
+            for _ in range(max_iter):
+                x2 = x2 + distance * direction
+                dists = torch.cdist(x1[..., 1, :], x2[..., 1, :])
+                min_dist = dists.min()
+                if min_dist >= min_distance:
+                    break
+                distance += step
+
+        return x1, x2
 
     def modify_coords(self, x, rot, tr):
         center = torch.mean(x[..., 1, :], dim=0, keepdim=True)
