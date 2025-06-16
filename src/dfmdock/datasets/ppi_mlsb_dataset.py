@@ -18,9 +18,29 @@ from scipy.spatial.transform import Rotation
 from dfmdock.utils import residue_constants
 from pinder.core.index.utils import get_index
 from pinder.data.plot.performance import get_subsampled_train
+from dfmdock.utils.pdb import save_PDB, place_fourth_atom 
 
 #----------------------------------------------------------------------------
 # Helper functions
+
+def get_full_coords(coords):
+    #get full coords
+    N, CA, C = [x.squeeze(-2) for x in coords.chunk(3, dim=-2)]
+    # Infer CB coordinates.
+    b = CA - N
+    c = C - CA
+    a = b.cross(c, dim=-1)
+    CB = -0.58273431 * a + 0.56802827 * b - 0.54067466 * c + CA
+    
+    O = place_fourth_atom(torch.roll(N, -1, 0),
+                                    CA, C,
+                                    torch.tensor(1.231),
+                                    torch.tensor(2.108),
+                                    torch.tensor(-3.142))
+    full_coords = torch.stack(
+        [N, CA, C, O, CB], dim=1)
+    
+    return full_coords
 
 def read_excluded_ids(file_path):
     """Read IDs from a file and return as a set."""
@@ -352,6 +372,7 @@ class PPIDataset(Dataset):
 
         # Training sets
 
+        # DIPS
         if dataset == 'dips_train':
             self.data_dir = "/scratch4/jgray21/lchu11/data/dips/pt_clean"
             self.data_list = "/scratch4/jgray21/lchu11/data/dips/data_list/diffdock-pp/train.txt" 
@@ -361,25 +382,22 @@ class PPIDataset(Dataset):
             self.data_list = "/scratch4/jgray21/lchu11/data/dips/data_list/diffdock-pp/val.txt" 
 
         elif dataset == 'dips_train_hetero':
-            self.data_dir = "/scratch4/jgray21/lchu11/data/dips/pt_clean"
+            self.data_dir = "/scratch4/jgray21/lchu11/data/pt/dips_bb"
             self.data_list = "/scratch4/jgray21/lchu11/data/dips/data_list/diffdock-pp/dips_train_hetero.txt" 
 
         elif dataset == 'dips_train_hetero_sub':
-            self.data_dir = "/scratch4/jgray21/lchu11/data/dips/pt_clean"
+            self.data_dir = "/scratch4/jgray21/lchu11/data/pt/dips_bb"
             self.data_list = "/scratch4/jgray21/lchu11/data/dips/data_list/diffdock-pp/dips_train_hetero_sub.txt" 
 
         elif dataset == 'dips_val_hetero':
-            self.data_dir = "/scratch4/jgray21/lchu11/data/dips/pt_clean"
+            self.data_dir = "/scratch4/jgray21/lchu11/data/pt/dips_bb"
             self.data_list = "/scratch4/jgray21/lchu11/data/dips/data_list/diffdock-pp/dips_val_hetero.txt" 
 
         elif dataset == 'dips_val_hetero_sub':
-            self.data_dir = "/scratch4/jgray21/lchu11/data/dips/pt_clean"
+            self.data_dir = "/scratch4/jgray21/lchu11/data/pt/dips_bb"
             self.data_list = "/scratch4/jgray21/lchu11/data/dips/data_list/diffdock-pp/dips_val_hetero_sub.txt" 
 
-        elif dataset == 'dips_single':
-            self.data_dir = "/scratch4/jgray21/lchu11/data/dips/pt_clean"
-            self.data_list = "/scratch4/jgray21/lchu11/data/dips/data_list/diffdock-pp/dips_single.txt" 
-
+        # PINDER
         elif dataset == 'pinder_train':
             self.data_dir = "/scratch4/jgray21/lchu11/data/pinder/train"
             self.file_list = [f.name.split('.')[0] for f in Path(self.data_dir).iterdir()]
@@ -401,35 +419,51 @@ class PPIDataset(Dataset):
             if self.use_esm:
                 self.h5f = h5py.File('/scratch16/jgray21/lchu11/data/h5_files/pinder_combined.h5', 'r')
 
-        elif dataset == 'db5_train_bound':
-            self.data_dir = "/scratch4/jgray21/lchu11/data/pt/db5_bound"
-            self.data_list = "/scratch4/jgray21/lchu11/data/db5/train_bound.txt"
+        # PPI3D
+        elif dataset == 'ppi3d_train_hetero':
+            self.data_dir = "/scratch4/jgray21/lchu11/data/ppi3d/gz_files"
+            self.data_list = "/scratch4/jgray21/lchu11/data/ppi3d/train_hetero_less_than_1200.txt"
+            self.esm_dir = "/scratch16/jgray21/lchu11/data/pt/ppi3d"
 
-        elif dataset == 'db5_val_bound':
-            self.data_dir = "/scratch4/jgray21/lchu11/data/pt/db5_bound"
-            self.data_list = "/scratch4/jgray21/lchu11/data/db5/val_bound.txt"
+        elif dataset == 'ppi3d_val_hetero':
+            self.data_dir = "/scratch4/jgray21/lchu11/data/ppi3d/gz_files"
+            self.data_list = "/scratch4/jgray21/lchu11/data/ppi3d/val_hetero_less_than_1200.txt"
+            self.esm_dir = "/scratch16/jgray21/lchu11/data/pt/ppi3d"
 
         # Testing sets
+
+        # DIPS
         elif dataset == 'dips_test':
             self.data_dir = "/scratch4/jgray21/lchu11/data/pt/dips_test"
             self.data_list = "/scratch4/jgray21/lchu11/data/dips/data_list/geodock/test.txt" 
 
+        # DB5
         elif dataset == 'db5_test':
             self.data_dir = "/scratch4/jgray21/lchu11/data/pt/db5_bound"
-            self.data_list = "/scratch4/jgray21/lchu11/data/db5/test_bound.txt"
+            self.data_list = "/scratch4/jgray21/lchu11/data/db5/test.txt"
+        
+        elif dataset == 'db5_test_bound':
+            self.data_dir = "/scratch4/jgray21/lchu11/data/pt/db5_test_bound"
+            self.data_list = "/scratch4/jgray21/lchu11/data/db5/test.txt"
             
         elif dataset == 'db5_all':
             self.data_dir = "/scratch4/jgray21/lchu11/data/pt/db5_bound"
-            self.data_list = "/scratch4/jgray21/lchu11/data/db5/test.txt"
+            self.data_list = "/scratch4/jgray21/lchu11/data/db5/all.txt"
+
+        elif dataset == 'db5_all_bound':
+            self.data_dir = "/scratch4/jgray21/lchu11/data/pt/db5_test_bound"
+            self.data_list = "/scratch4/jgray21/lchu11/data/db5/all.txt"
 
         elif dataset == 'db5_ab_ag':
             self.data_dir = "/scratch4/jgray21/lchu11/data/pt/db5_bound"
             self.data_list = "/scratch4/jgray21/lchu11/data/db5/ab_ag.txt"
 
-        elif dataset == 'af_ab_ag':
+        # AB-AG
+        elif dataset == 'ab_ag':
             self.data_dir = "/scratch4/jgray21/lchu11/data/pt/ab_ag"
             self.data_list = "/scratch4/jgray21/lchu11/data/ab_ag/Yin/af2.3_benchmark/test.txt"
         
+        # PINDER
         elif dataset == 'pinder_s':
             pindex = get_index()
             self.data_dir = "/scratch4/jgray21/lchu11/data/pinder/test" 
@@ -478,6 +512,20 @@ class PPIDataset(Dataset):
             rec_pos = torch.from_numpy(data['rec_pos']).float()
             lig_pos = torch.from_numpy(data['lig_pos']).float()
 
+        elif self.dataset[:5] == 'ppi3d':
+            data_path = os.path.join(self.data_dir, f'{self.file_list[idx]}.pth.gz')
+            with gzip.open(data_path, "rb") as f:
+                data = torch.load(f)
+            esm_data = torch.load(os.path.join(self.esm_dir, self.file_list[idx] + '.pt'))
+            
+            _id = data['id']
+            rec_seq = data['rec_seq']
+            lig_seq = data['lig_seq']
+            rec_pos = data['rec_pos'][..., :3, :]
+            lig_pos = data['lig_pos'][..., :3, :]
+            rec_esm = esm_data['receptor'].x
+            lig_esm = esm_data['ligand'].x
+
         else:
             _id = self.file_list[idx]
             data = torch.load(os.path.join(self.data_dir, _id+'.pt'))
@@ -522,7 +570,6 @@ class PPIDataset(Dataset):
             rec_x, rec_seq, rec_pos = vars_list[0]
             lig_x, lig_seq, lig_pos = vars_list[1]
 
-            # Crop to crop_size
             rec_x, lig_x, rec_pos, lig_pos, res_id, asym_id= self.crop_to_size(rec_x, lig_x, rec_seq, lig_seq, rec_pos, lig_pos)  
         else:
             # make the smaller one ligand
@@ -547,6 +594,13 @@ class PPIDataset(Dataset):
         center = lig_pos[..., 1, :].mean(dim=0)
         rec_pos -= center
         lig_pos -= center
+
+        # outpdb
+        """
+        coords = torch.cat([rec_pos, lig_pos], dim=0)
+        coords = get_full_coords(coords)
+        save_PDB(out_pdb="test.pdb", coords=coords, seq=rec_seq+lig_seq, delim=len(rec_seq)-1)
+        """
 
         # Interface residues
         rec_ires, lig_ires = get_interface_residue_tensors(rec_pos[..., 1, :], lig_pos[..., 1, :])
@@ -580,7 +634,6 @@ class PPIDataset(Dataset):
         pos = torch.cat([rec_pos, lig_pos], dim=0)
 
         use_spatial_crop = random.random() < 0.5
-        #use_spatial_crop = True
         num_res = asym_id.size(0)
 
         if num_res <= self.crop_size:
@@ -673,4 +726,4 @@ if __name__ == '__main__':
         dataset="db5_test",
     )
     print(len(dataset))
-    print(dataset[0])
+    print(dataset[7])

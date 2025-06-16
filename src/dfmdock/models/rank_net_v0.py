@@ -26,6 +26,15 @@ class ModelConfig:
 #----------------------------------------------------------------------------
 # Helper functions
 
+def get_rbf(D):
+    device = D.device
+    D_min, D_max, D_count = 2., 22., 16
+    D_mu = torch.linspace(D_min, D_max, D_count, device=device)
+    D_mu = D_mu.view([1,1,-1])
+    D_sigma = (D_max - D_min) / D_count
+    RBF = torch.exp(-((D - D_mu) / D_sigma)**2)
+    return RBF
+
 def get_spatial_matrix(coord):
     dist, omega, theta, phi = get_coords6d(coord)
 
@@ -310,11 +319,10 @@ class Rank_Net(nn.Module):
         self.cut_off = conf.cut_off
         
         # single init embedding
-        self.single_embed = nn.Linear(lm_embed_dim, node_dim, bias=False)
+        self.single_embed = nn.Linear(lm_embed_dim + 1, node_dim, bias=False)
 
         # pair init embedding
-        self.spatial_embed = nn.Linear(spatial_embed_dim, edge_dim, bias=False)
-        self.positional_embed = nn.Linear(positional_embed_dim, edge_dim, bias=False)
+        self.pair_embed = nn.Linear(spatial_embed_dim + positional_embed_dim, edge_dim, bias=False)
 
         # denoising score network
         self.network = EGNN(
@@ -331,9 +339,10 @@ class Rank_Net(nn.Module):
 
         # confidence
         self.to_confidence = nn.Sequential(
-            nn.Linear(2*node_dim, node_dim, bias=False),
+            nn.Linear(node_dim, node_dim, bias=False),
             nn.LayerNorm(node_dim),
             nn.SiLU(),
+            nn.Dropout(dropout),
             nn.Linear(node_dim, 1, bias=False),
         )
 
@@ -362,32 +371,25 @@ class Rank_Net(nn.Module):
         lig_pos = lig_pos - center
 
         # get the current complex pose
-        lig_pos.requires_grad_()
         pos = torch.cat([rec_pos, lig_pos], dim=0)
 
-        # get ca distance matrix 
-        D = torch.norm((rec_pos[:, None, 1, :] - lig_pos[None, :, 1, :]), dim=-1)
-
         # node feature embedding
+        rec_x = torch.cat([rec_x, torch.zeros_like(rec_x[:, :1])], dim=-1)
+        lig_x = torch.cat([lig_x, torch.ones_like(lig_x[:, :1])], dim=-1)
         x = torch.cat([rec_x, lig_x], dim=0)
-        node = self.single_embed(x)
+        node = self.single_embed(x) 
 
         # edge feature embedding
         spatial_matrix = get_spatial_matrix(pos)
-        edge = self.spatial_embed(spatial_matrix) + self.positional_embed(position_matrix)
+        edge = self.pair_embed(torch.cat([spatial_matrix, position_matrix], dim=-1)) 
 
         # sample edge_index and get edge_attr
         edge_index, edge_attr = get_knn_and_sample_graph(pos[..., 1, :], edge)
 
         # main network 
-        node_out = self.network(node, pos[..., 1, :], edge_index, edge_attr)
+        node_out = self.network(node, pos[..., 1, :], edge_index, edge_attr) 
 
-        # energy
-        h_rec = repeat(node_out[:rec_pos.size(0)], 'n h -> n m h', m=lig_pos.size(0))
-        h_lig = repeat(node_out[rec_pos.size(0):], 'm h -> n m h', n=rec_pos.size(0))
-        confidence = self.to_confidence(torch.cat([h_rec, h_lig], dim=-1)).squeeze(-1)
-        mask_2D = (D < self.cut_off).float()
-        confidence = (confidence * mask_2D).sum() / (mask_2D.sum() + 1e-6) 
+        confidence = self.to_confidence(node_out).mean()
 
         return confidence
     

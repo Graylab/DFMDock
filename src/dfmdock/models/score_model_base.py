@@ -37,24 +37,18 @@ class Score_Model(pl.LightningModule):
 
         # energy
         self.grad_energy = experiment.grad_energy
-        self.separate_energy_loss = experiment.separate_energy_loss
         
         # translation
         self.perturb_tr = experiment.perturb_tr
-        self.separate_tr_loss = experiment.separate_tr_loss
 
         # rotation
         self.perturb_rot = experiment.perturb_rot
-        self.separate_rot_loss = experiment.separate_rot_loss
 
         # contrastive
         self.use_contrastive_loss = experiment.use_contrastive_loss
 
         # interface 
         self.use_interface_loss = experiment.use_interface_loss
-
-        # contact
-        self.use_energy_gt_loss = experiment.use_energy_gt_loss
 
         # diffuser
         if self.perturb_tr:
@@ -105,9 +99,6 @@ class Score_Model(pl.LightningModule):
             # update poses          
             batch["lig_pos"] = self.modify_coords(batch["lig_pos"], rot_update, tr_update)
 
-            # number of lig nodes
-            n = batch["lig_pos"].size(0)
-
         # predict score based on the current state
         if self.grad_energy:
             outputs = self.net(batch)
@@ -117,26 +108,7 @@ class Score_Model(pl.LightningModule):
             rot_score = outputs["rot_score"]
             tr_grad = outputs["tr_grad"]
             rot_grad = outputs["rot_score"]
-            f = outputs["f"]
-            f_grad = outputs["f_grad"]
             energy_noised = outputs["energy"]
-
-            # energy conservation loss
-            if self.separate_energy_loss:
-                f_mag = torch.norm(f, dim=-1, keepdim=True)
-                f_dir = f / (f_mag + 1e-6)
-
-                f_grad_mag = torch.norm(f_grad, dim=-1, keepdim=True)
-                f_grad_dir = f_grad / (f_grad_mag + 1e-6)
-
-                #print(f_mag.mean(), f_grad_mag.mean())
-
-                ec_dir_loss = torch.mean((f_grad_dir - f_dir)**2)
-                ec_mag_loss = torch.mean((f_grad_mag - f_mag)**2) 
-                ec_loss = 0.5 * ec_dir_loss + 0.5 * ec_mag_loss 
-
-            else:
-                ec_loss = torch.mean((f_grad - f)**2) 
         else:
             outputs = self.net(batch, predict=True)
 
@@ -145,68 +117,51 @@ class Score_Model(pl.LightningModule):
             rot_score = outputs["rot_score"]
             energy_noised = outputs["energy"]
             
-            # energy conservation loss
-            ec_loss = torch.tensor(0.0, device=self.device)
-
         # translation loss
         if self.perturb_tr:
-            if self.separate_tr_loss:
-                gt_tr_mag = torch.norm(tr_score_gt, dim=-1, keepdim=True)
-                gt_tr_dir = tr_score_gt / (gt_tr_mag + 1e-6)
+            # gt
+            gt_tr_mag = torch.norm(tr_score_gt, dim=-1, keepdim=True)
+            gt_tr_dir = tr_score_gt / (gt_tr_mag + 1e-6)
 
-                pred_tr_mag = torch.norm(tr_score, dim=-1, keepdim=True)
-                pred_tr_dir = tr_score / (pred_tr_mag + 1e-6)
-
-                #print(gt_tr_mag, pred_tr_mag, tr_score_scale)
-                #print(tr_sigma, 1.0 / tr_score_scale)
-
-                tr_dir_loss = torch.mean((pred_tr_dir - gt_tr_dir)**2)
-                tr_mag_loss = torch.mean((pred_tr_mag - gt_tr_mag)**2 / tr_score_scale**2)
-                tr_loss = 0.5 * tr_dir_loss + 0.5 * tr_mag_loss
-                
-                if self.use_energy_gt_loss:
-                    pred_tr_grad_mag = torch.norm(tr_grad, dim=-1, keepdim=True)
-                    pred_tr_grad_dir = tr_grad / (pred_tr_grad_mag + 1e-6)
-                    tr_grad_dir_loss = torch.mean((pred_tr_grad_dir - gt_tr_dir)**2)
-                    tr_grad_mag_loss = torch.mean((pred_tr_grad_mag - gt_tr_mag)**2 / tr_score_scale**2)
-                    tr_grad_loss = 0.5 * tr_grad_dir_loss + 0.5 * tr_grad_mag_loss
-                else:
-                    tr_grad_loss = torch.tensor(0.0, device=self.device) 
-                    
-            else:
-                tr_loss = torch.mean((tr_score - tr_score_gt)**2 / tr_score_scale**2)
+            # score
+            pred_tr_mag = torch.norm(tr_score, dim=-1, keepdim=True)
+            pred_tr_dir = tr_score / (pred_tr_mag + 1e-6)
+            tr_dir_loss = torch.mean((pred_tr_dir - gt_tr_dir)**2)
+            tr_mag_loss = torch.mean((pred_tr_mag - gt_tr_mag)**2 / tr_score_scale**2)
+            tr_loss = 0.5 * tr_dir_loss + 0.5 * tr_mag_loss
+            
+            # grad
+            pred_tr_grad_mag = torch.norm(tr_grad, dim=-1, keepdim=True)
+            pred_tr_grad_dir = tr_grad / (pred_tr_grad_mag + 1e-6)
+            tr_grad_dir_loss = torch.mean((pred_tr_grad_dir - gt_tr_dir)**2)
+            tr_grad_mag_loss = torch.mean((pred_tr_grad_mag - gt_tr_mag)**2 / tr_score_scale**2)
+            tr_grad_loss = 0.5 * tr_grad_dir_loss + 0.5 * tr_grad_mag_loss
         else:
             tr_loss = torch.tensor(0.0, device=self.device)
+            tr_grad_loss = torch.tensor(0.0, device=self.device)
 
         # rotation loss
         if self.perturb_rot:
-            if self.separate_rot_loss:
-                gt_rot_mag = torch.norm(rot_score_gt, dim=-1, keepdim=True)
-                gt_rot_dir = rot_score_gt / (gt_rot_mag + 1e-6)
+            # gt
+            gt_rot_mag = torch.norm(rot_score_gt, dim=-1, keepdim=True)
+            gt_rot_dir = rot_score_gt / (gt_rot_mag + 1e-6)
 
-                pred_rot_mag = torch.norm(rot_score, dim=-1, keepdim=True)
-                pred_rot_dir = rot_score / (pred_rot_mag + 1e-6)
+            # score 
+            pred_rot_mag = torch.norm(rot_score, dim=-1, keepdim=True)
+            pred_rot_dir = rot_score / (pred_rot_mag + 1e-6)
+            rot_dir_loss = torch.mean((pred_rot_dir - gt_rot_dir)**2)
+            rot_mag_loss = torch.mean((pred_rot_mag - gt_rot_mag)**2 / rot_score_scale**2)
+            rot_loss = 0.5 * rot_dir_loss + 0.5 * rot_mag_loss
 
-                #print(gt_rot_mag, pred_rot_mag, rot_score_scale)
-                #print(rot_sigma, 1.0 / rot_score_scale)
-
-                rot_dir_loss = torch.mean((pred_rot_dir - gt_rot_dir)**2)
-                rot_mag_loss = torch.mean((pred_rot_mag - gt_rot_mag)**2 / rot_score_scale**2)
-                rot_loss = 0.5 * rot_dir_loss + 0.5 * rot_mag_loss
-
-                if self.use_energy_gt_loss:
-                    pred_rot_grad_mag = torch.norm(rot_grad, dim=-1, keepdim=True)
-                    pred_rot_grad_dir = rot_grad / (pred_rot_grad_mag + 1e-6)
-                    rot_grad_dir_loss = torch.mean((pred_rot_grad_dir - gt_rot_dir)**2)
-                    rot_grad_mag_loss = torch.mean((pred_rot_grad_mag - gt_rot_mag)**2 / rot_score_scale**2)
-                    rot_grad_loss = 0.5 * rot_grad_dir_loss + 0.5 * rot_grad_mag_loss
-                else:
-                    tr_grad_loss = torch.tensor(0.0, device=self.device) 
-
-            else:
-                rot_loss = torch.mean((rot_score - rot_score_gt)**2 / rot_score_scale**2)
+            # grad
+            pred_rot_grad_mag = torch.norm(rot_grad, dim=-1, keepdim=True)
+            pred_rot_grad_dir = rot_grad / (pred_rot_grad_mag + 1e-6)
+            rot_grad_dir_loss = torch.mean((pred_rot_grad_dir - gt_rot_dir)**2)
+            rot_grad_mag_loss = torch.mean((pred_rot_grad_mag - gt_rot_mag)**2 / rot_score_scale**2)
+            rot_grad_loss = 0.5 * rot_grad_dir_loss + 0.5 * rot_grad_mag_loss             
         else:
             rot_loss = torch.tensor(0.0, device=self.device)
+            rot_grad_loss = torch.tensor(0.0, device=self.device) 
         
         # contrastive loss
         # modified from https://github.com/yilundu/ired_code_release/blob/main/diffusion_lib/denoising_diffusion_pytorch_1d.py
@@ -226,27 +181,16 @@ class Score_Model(pl.LightningModule):
             ires_loss = torch.tensor(0.0, device=self.device)
         
         # total losses
-        loss = tr_loss + rot_loss + tr_grad_loss + rot_grad_loss + ec_loss + el_loss + ires_loss
+        loss = tr_loss + rot_loss + tr_grad_loss + rot_grad_loss + el_loss + ires_loss
         losses = {
             "tr_loss": tr_loss, 
             "rot_loss": rot_loss, 
             "tr_grad_loss": tr_grad_loss, 
             "rot_grad_loss": rot_grad_loss, 
-            "ec_loss": ec_loss, 
             "el_loss": el_loss, 
             "ires_loss": ires_loss,
             "loss": loss,
         }
-
-        if (self.grad_energy and self.separate_energy_loss):
-            losses["ec_dir_loss"] = ec_dir_loss
-            losses["ec_mag_loss"] = ec_mag_loss
-        if (self.perturb_tr and self.separate_tr_loss):
-            losses["tr_dir_loss"] = tr_dir_loss
-            losses["tr_mag_loss"] = tr_mag_loss
-        if (self.perturb_rot and self.separate_rot_loss):
-            losses["rot_dir_loss"] = rot_dir_loss
-            losses["rot_mag_loss"] = rot_mag_loss
 
         return losses
 

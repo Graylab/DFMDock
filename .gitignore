@@ -171,6 +171,7 @@ debug/
 data/
 networks/
 pinder_train/
+figures/
 *.pdb
 *.csv
 *.ipynb

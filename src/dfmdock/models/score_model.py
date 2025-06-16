@@ -14,7 +14,8 @@ from omegaconf import DictConfig
 from dfmdock.utils.so3_diffuser import SO3Diffuser 
 from dfmdock.utils.r3_diffuser import R3Diffuser 
 from dfmdock.utils.geometry import axis_angle_to_matrix, matrix_to_axis_angle
-from dfmdock.datasets.ppi_docking_dataset import PPIDataset
+from dfmdock.datasets.ppi_mlsb_dataset import PPIDataset
+from dfmdock.utils.dockq import get_dockq
 
 #----------------------------------------------------------------------------
 # Main wrapper for training the model
@@ -105,8 +106,9 @@ class Score_Model(pl.LightningModule):
             # update poses          
             batch["lig_pos"] = self.modify_coords(batch["lig_pos"], rot_update, tr_update)
 
-            # number of lig nodes
-            n = batch["lig_pos"].size(0)
+            # get dockq
+            #dockq_noised = get_dockq((batch["rec_pos"], batch["lig_pos"]), (batch_gt["rec_pos"], batch_gt["lig_pos"]))
+            #print(dockq_noised)
 
         # predict score based on the current state
         if self.grad_energy:
@@ -118,6 +120,12 @@ class Score_Model(pl.LightningModule):
             f = outputs["f"]
             dedx = outputs["dedx"]
             energy_noised = outputs["energy"]
+
+            print(f.norm())
+            print(dedx.norm())
+            print(energy_noised)
+            #print(tr_score, tr_score_gt)
+            #print(rot_score, rot_score_gt)
 
             # energy conservation loss
             if self.separate_energy_loss:
@@ -195,6 +203,11 @@ class Score_Model(pl.LightningModule):
             energy_stack = torch.stack([energy_gt, energy_noised], dim=-1)
             target = torch.zeros([], device=energy_stack.device)
             el_loss = F.cross_entropy(-1 * energy_stack, target.long(), reduction='none')
+            #dockq = torch.stack([torch.ones_like(dockq_noised), dockq_noised], dim=-1)
+            #target_probs = dockq / (dockq.sum(dim=-1, keepdim=True) + 1e-8)  
+            #log_probs = torch.log_softmax(-energy_stack, dim=-1)             
+            #el_loss = F.kl_div(log_probs, target_probs, reduction='sum')
+            #el_loss = F.relu(energy_gt - energy_noised + 1.0)
         else: 
             el_loss = torch.tensor(0.0, device=self.device) 
 
@@ -208,10 +221,9 @@ class Score_Model(pl.LightningModule):
         # contact loss
         if self.use_contact_loss:
             gt_dist = torch.norm(batch_gt['rec_pos'][:, None, 1, :] - batch_gt['lig_pos'][None, :, 1, :], dim=-1, keepdim=True)
-            cut_off = 10.0
+            cut_off = 8.0
             gt_contact = (gt_dist < cut_off).float()
-            #contact_loss = bce_logits_loss(outputs['contact'], gt_contact)
-            contact_loss = focal_loss(outputs['contact'], gt_contact)
+            contact_loss = bce_logits_loss(outputs['contact'], gt_contact)
         else:
             contact_loss = torch.tensor(0.0, device=self.device)
 
@@ -298,22 +310,16 @@ class Score_Model(pl.LightningModule):
             )
         return losses["loss"]
 
-    def on_validation_model_eval(self, *args, **kwargs):
-        super().on_validation_model_eval(*args, **kwargs)
-        torch.set_grad_enabled(True)
-    
-    def on_validation_model_train(self, *args, **kwargs):
-        super().on_validation_model_train(*args, **kwargs)
-        torch.set_grad_enabled(True)
-
     def validation_step(self, batch, batch_idx):
-        losses = self.step(batch, batch_idx)
-        #dockq = self.inference(batch)
+        with torch.set_grad_enabled(True):
+            losses = self.step(batch, batch_idx)
+            
         for loss_name, indiv_loss in losses.items():
             self.log(
                 f"val/{loss_name}", 
                 indiv_loss, 
                 batch_size=1,
+                sync_dist=True,
             )
         return losses["loss"]
 
@@ -375,8 +381,9 @@ def focal_loss(inputs, targets, alpha=0.25, gamma=2.0, reduction='mean'):
 def main(conf: DictConfig):
     dataset = PPIDataset(
         dataset='dips_train_hetero',
-        crop_size=500,
+        crop_size=1200,
     )
+    print(len(dataset))
     index = random.randint(0, len(dataset) - 1)
 
     subset_indices = [index]

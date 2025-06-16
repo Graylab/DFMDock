@@ -26,6 +26,15 @@ class ModelConfig:
 #----------------------------------------------------------------------------
 # Helper functions
 
+def get_rbf(D):
+    device = D.device
+    D_min, D_max, D_count = 2., 22., 16
+    D_mu = torch.linspace(D_min, D_max, D_count, device=device)
+    D_mu = D_mu.view([1,1,-1])
+    D_sigma = (D_max - D_min) / D_count
+    RBF = torch.exp(-((D - D_mu) / D_sigma)**2)
+    return RBF
+
 def get_spatial_matrix(coord):
     dist, omega, theta, phi = get_coords6d(coord)
 
@@ -311,11 +320,10 @@ class Score_Net(nn.Module):
         self.cut_off = conf.cut_off
         
         # single init embedding
-        self.single_embed = nn.Linear(lm_embed_dim, node_dim, bias=False)
+        self.single_embed = nn.Linear(lm_embed_dim + 1, node_dim, bias=False)
 
         # pair init embedding
-        self.spatial_embed = nn.Linear(spatial_embed_dim, edge_dim, bias=False)
-        self.positional_embed = nn.Linear(positional_embed_dim, edge_dim, bias=False)
+        self.pair_embed = nn.Linear(spatial_embed_dim + positional_embed_dim, edge_dim, bias=False)
 
         # denoising score network
         self.network = EGNN(
@@ -332,7 +340,7 @@ class Score_Net(nn.Module):
 
         # energy head
         self.to_energy = nn.Sequential(
-            nn.Linear(2*node_dim + 1, node_dim, bias=False),
+            nn.Linear(2*node_dim + 16 + 3, node_dim, bias=False),
             nn.LayerNorm(node_dim),
             nn.SiLU(),
             nn.Dropout(dropout),
@@ -341,12 +349,10 @@ class Score_Net(nn.Module):
 
         # interface residue head
         self.to_ires = nn.Sequential(
-            nn.Linear(node_dim, 2*node_dim),
-            nn.SiLU(),
-            nn.Linear(2*node_dim, 2*node_dim),
+            nn.Linear(node_dim, node_dim, bias=False),
             nn.SiLU(),
             nn.Dropout(dropout),
-            nn.Linear(2*node_dim, 1),
+            nn.Linear(node_dim, 1, bias=False),
         )
 
         # timestep embedding
@@ -402,19 +408,24 @@ class Score_Net(nn.Module):
         lig_pos = lig_pos - center
 
         # get ca distance matrix 
-        d_ij = torch.norm((rec_pos[:, None, 1, :] - lig_pos[None, :, 1, :]), dim=-1, keepdim=True)
+        v_ij = lig_pos[None, :, 1, :] - rec_pos[:, None, 1, :]
+        d_ij = torch.norm(v_ij, dim=-1, keepdim=True)
+        r_ij = F.normalize(v_ij, dim=-1)
+        rbf = get_rbf(d_ij)
 
         # get the current complex pose
         lig_pos.requires_grad_()
         pos = torch.cat([rec_pos, lig_pos], dim=0)
 
         # node feature embedding
+        rec_x = torch.cat([rec_x, torch.zeros_like(rec_x[:, :1])], dim=-1)
+        lig_x = torch.cat([lig_x, torch.ones_like(lig_x[:, :1])], dim=-1)
         x = torch.cat([rec_x, lig_x], dim=0)
         node = self.single_embed(x) 
 
         # edge feature embedding
         spatial_matrix = get_spatial_matrix(pos)
-        edge = self.spatial_embed(spatial_matrix) + self.positional_embed(position_matrix)
+        edge = self.pair_embed(torch.cat([spatial_matrix, position_matrix], dim=-1)) 
 
         # sample edge_index and get edge_attr
         edge_index, edge_attr = get_knn_and_sample_graph(pos[..., 1, :], edge)
@@ -429,12 +440,18 @@ class Score_Net(nn.Module):
         # interface residue
         ires = self.to_ires(node_out)
 
+        # pair
+        h_i = repeat(node_out[:rec_pos.size(0)], 'n h -> n m h', m=lig_pos.size(0))
+        h_j = repeat(node_out[rec_pos.size(0):], 'm h -> n m h', n=rec_pos.size(0))
+        h_ij = torch.cat([h_i, h_j, rbf, r_ij], dim=-1)
+
+        # weights
+        sigma = 10.0
+        weights = torch.exp(-(d_ij ** 2) / (sigma ** 2))
+
         # energy
-        h_rec = repeat(node_out[:rec_pos.size(0)], 'n h -> n m h', m=lig_pos.size(0))
-        h_lig = repeat(node_out[rec_pos.size(0):], 'm h -> n m h', n=rec_pos.size(0))
-        energy = self.to_energy(torch.cat([h_rec, h_lig, d_ij], dim=-1))
-        mask_2D = (d_ij < self.cut_off).float()
-        energy = (energy * mask_2D).sum()
+        e_ij = self.to_energy(h_ij)
+        energy = (e_ij * weights).sum()
 
         if return_energy:
             return energy

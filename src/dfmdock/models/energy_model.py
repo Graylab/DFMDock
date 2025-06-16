@@ -21,7 +21,7 @@ from dfmdock.datasets.ppi_mlsb_dataset import PPIDataset
 #----------------------------------------------------------------------------
 # Main wrapper for training the model
 
-class Rank_Model(pl.LightningModule):
+class Energy_Model(pl.LightningModule):
     def __init__(
         self,
         model,
@@ -69,7 +69,7 @@ class Rank_Model(pl.LightningModule):
         
         # net
         module = importlib.import_module(f"dfmdock.models.{model.file_name}")
-        self.net = module.Rank_Net(model)
+        self.net = module.Energy_Net(model)
     
     def forward(self, batch):
         outputs = self.net(batch, predict=True)
@@ -88,11 +88,19 @@ class Rank_Model(pl.LightningModule):
             batch["rec_pos"], batch["lig_pos"] = self.Euler_Maruyama_sampler(batch)
 
             # get dockq
-            dockq, i_rmsd, l_rmsd, fnat = get_dockq((batch["rec_pos"], batch["lig_pos"]), (batch_gt["rec_pos"], batch_gt["lig_pos"]))
+            metric = get_dockq((batch["rec_pos"], batch["lig_pos"]), (batch_gt["rec_pos"], batch_gt["lig_pos"]))
+            dockq_noised = metric[0]
 
-        confidence = self.net(batch)
-        bce_logits_loss = nn.BCEWithLogitsLoss()
-        loss = bce_logits_loss(confidence, (l_rmsd < 5.0).float())
+        # contrastive loss 
+        energy_pred = self.net(batch)
+        energy_gt = self.net(batch_gt)
+        energy_stack = torch.stack([energy_gt, energy_pred], dim=-1)
+        #target = torch.zeros([], device=energy_stack.device)
+        #el_loss = F.cross_entropy(-1 * energy_stack, target.long(), reduction='none')
+        dockq = torch.stack([torch.ones_like(dockq_noised), dockq_noised], dim=-1)
+        target_probs = dockq / (dockq.sum(dim=-1, keepdim=True) + 1e-8)  
+        log_probs = torch.log_softmax(-energy_stack, dim=-1)             
+        loss = F.kl_div(log_probs, target_probs, reduction='sum')
 
         losses = {
             "loss": loss,
@@ -330,7 +338,7 @@ def get_rmsd(pred, label):
 #----------------------------------------------------------------------------
 # Testing run
 
-@hydra.main(version_base=None, config_path="/scratch4/jgray21/lchu11/graylab_repos/DFMDock/configs/model", config_name="rank_model.yaml")
+@hydra.main(version_base=None, config_path="/scratch4/jgray21/lchu11/graylab_repos/DFMDock/configs/model", config_name="energy_model.yaml")
 def main(conf: DictConfig):
     dataset = PPIDataset(
         dataset='dips_train_hetero',
@@ -343,7 +351,7 @@ def main(conf: DictConfig):
     #load dataset
     dataloader = DataLoader(subset)
     
-    model = Rank_Model(
+    model = Energy_Model(
         model=conf.model, 
         diffuser=conf.diffuser,
         experiment=conf.experiment

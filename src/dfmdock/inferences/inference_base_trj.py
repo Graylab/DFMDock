@@ -14,7 +14,7 @@ from dataclasses import dataclass
 from tqdm import tqdm
 from torch.utils import data
 from scipy.spatial.transform import Rotation 
-from dfmdock.models.score_model import Score_Model
+from dfmdock.models.score_model_base import Score_Model
 from dfmdock.datasets.ppi_docking_dataset import PPIDataset
 from dfmdock.utils.geometry import axis_angle_to_matrix, matrix_to_axis_angle
 from dfmdock.utils.pdb import save_PDB, place_fourth_atom 

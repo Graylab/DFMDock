@@ -212,22 +212,23 @@ class PPIDataset(Dataset):
             self.data_dir = "/scratch4/jgray21/lchu11/data/dips/pt_clean"
             self.data_list = "/scratch4/jgray21/lchu11/data/dips/data_list/diffdock-pp/val.txt" 
 
-        elif dataset == 'dips_train_val':
-            self.data_dir = "/scratch4/jgray21/lchu11/data/dips/pt_clean"
-            self.data_list = "/scratch4/jgray21/lchu11/data/dips/data_list/diffdock-pp/train_val.txt" 
-
         elif dataset == 'dips_train_hetero':
             self.data_dir = "/scratch4/jgray21/lchu11/data/dips/pt_clean"
             self.data_list = "/scratch4/jgray21/lchu11/data/dips/data_list/diffdock-pp/dips_train_hetero.txt" 
 
+        elif dataset == 'dips_train_hetero_sub':
+            self.data_dir = "/scratch4/jgray21/lchu11/data/pt/dips_bb"
+            self.data_list = "/scratch4/jgray21/lchu11/data/dips/data_list/diffdock-pp/dips_train_hetero_sub.txt" 
+
         elif dataset == 'dips_val_hetero':
-            self.data_dir = "/scratch4/jgray21/lchu11/data/dips/pt_clean"
+            self.data_dir = "/scratch4/jgray21/lchu11/data/pt/dips_bb"
             self.data_list = "/scratch4/jgray21/lchu11/data/dips/data_list/diffdock-pp/dips_val_hetero.txt" 
 
-        elif dataset == 'dips_single':
-            self.data_dir = "/scratch4/jgray21/lchu11/data/dips/pt_clean"
-            self.data_list = "/scratch4/jgray21/lchu11/data/dips/data_list/diffdock-pp/dips_single.txt" 
+        elif dataset == 'dips_val_hetero_sub':
+            self.data_dir = "/scratch4/jgray21/lchu11/data/pt/dips_bb"
+            self.data_list = "/scratch4/jgray21/lchu11/data/dips/data_list/diffdock-pp/dips_val_hetero_sub.txt" 
 
+        # PINDER
         elif dataset == 'pinder_train':
             self.data_dir = "/scratch4/jgray21/lchu11/data/pinder/train"
             self.file_list = [f.name.split('.')[0] for f in Path(self.data_dir).iterdir()]
@@ -242,39 +243,66 @@ class PPIDataset(Dataset):
                 lines = f.readlines()
             self.file_list = [line.strip() for line in lines] 
 
+        # PPI3D
         elif dataset == 'ppi3d_train':
             self.data_dir = "/scratch4/jgray21/lchu11/data/ppi3d/gz_files"
-            self.data_list = "/scratch4/jgray21/lchu11/data/ppi3d/train.txt"
+            self.data_list = "/scratch4/jgray21/lchu11/data/ppi3d/train_less_than_1200.txt"
 
         elif dataset == 'ppi3d_val':
             self.data_dir = "/scratch4/jgray21/lchu11/data/ppi3d/gz_files"
-            self.data_list = "/scratch4/jgray21/lchu11/data/ppi3d/val.txt"
+            self.data_list = "/scratch4/jgray21/lchu11/data/ppi3d/val_less_than_1200.txt"
+
+        elif dataset == 'ppi3d_train_hetero':
+            self.data_dir = "/scratch4/jgray21/lchu11/data/ppi3d/gz_files"
+            self.data_list = "/scratch4/jgray21/lchu11/data/ppi3d/train_hetero_less_than_1200.txt"
+
+        elif dataset == 'ppi3d_val_hetero':
+            self.data_dir = "/scratch4/jgray21/lchu11/data/ppi3d/gz_files"
+            self.data_list = "/scratch4/jgray21/lchu11/data/ppi3d/val_hetero_less_than_1200.txt"
 
         # Testing sets
+
+        # DIPS
         elif dataset == 'dips_test':
             self.data_dir = "/scratch4/jgray21/lchu11/data/pt/dips_test"
             self.data_list = "/scratch4/jgray21/lchu11/data/dips/data_list/geodock/test.txt" 
 
+        # DB5
         elif dataset == 'db5_test':
-            self.data_dir = "/scratch4/jgray21/lchu11/data/pt/db5_bound"
-            self.data_list = "/scratch4/jgray21/lchu11/data/db5/test_bound.txt"
+            #self.data_dir = "/scratch4/jgray21/lchu11/data/pt/db5_bound"
+            self.data_dir = "/scratch4/jgray21/lchu11/data/pt/db5_test_bound"
+            self.data_list = "/scratch4/jgray21/lchu11/data/db5/test.txt"
             
         elif dataset == 'db5_all':
-            self.data_dir = "/scratch4/jgray21/lchu11/data/pt/db5_bound"
-            self.data_list = "/scratch4/jgray21/lchu11/data/db5/test.txt"
+            #self.data_dir = "/scratch4/jgray21/lchu11/data/pt/db5_bound"
+            self.data_dir = "/scratch4/jgray21/lchu11/data/pt/db5_test_bound"
+            self.data_list = "/scratch4/jgray21/lchu11/data/db5/all.txt"
 
         elif dataset == 'db5_ab_ag':
-            self.data_dir = "/scratch4/jgray21/lchu11/data/pt/db5_bound"
+            #self.data_dir = "/scratch4/jgray21/lchu11/data/pt/db5_bound"
+            self.data_dir = "/scratch4/jgray21/lchu11/data/pt/db5_test_bound"
             self.data_list = "/scratch4/jgray21/lchu11/data/db5/ab_ag.txt"
 
-        elif dataset == 'af_ab_ag':
+        # AB-AG
+        elif dataset == 'ab_ag':
             self.data_dir = "/scratch4/jgray21/lchu11/data/pt/ab_ag"
             self.data_list = "/scratch4/jgray21/lchu11/data/ab_ag/Yin/af2.3_benchmark/test.txt"
         
+        # PINDER
         elif dataset == 'pinder_s':
             pindex = get_index()
             self.data_dir = "/scratch4/jgray21/lchu11/data/pinder/test" 
             self.file_list = list(pindex.query('pinder_s == True').id)
+
+        elif dataset == 'pinder_af2':
+            pindex = get_index()
+            self.data_dir = "/scratch4/jgray21/lchu11/data/pinder/test" 
+            self.file_list = list(pindex.query('pinder_af2 == True').id)
+
+        elif dataset == 'pinder_xl':
+            pindex = get_index()
+            self.data_dir = "/scratch4/jgray21/lchu11/data/pinder/test" 
+            self.file_list = list(pindex.query('pinder_xl == True').id)
         
         if self.dataset[:6] != 'pinder':
             with open(self.data_list, 'r') as f:
@@ -341,7 +369,7 @@ class PPIDataset(Dataset):
             lig_x, lig_seq, lig_pos = vars_list[1]
 
             # Crop to crop_size
-            rec_x, lig_x, rec_pos, lig_pos, res_id, asym_id= self.crop_to_size(rec_x, lig_x, rec_seq, lig_seq, rec_pos, lig_pos)  
+            rec_x, lig_x, rec_seq, lig_seq, rec_pos, lig_pos, res_id, asym_id = self.crop_to_size(rec_x, lig_x, rec_seq, lig_seq, rec_pos, lig_pos)  
         else:
             # make the smaller one ligand
             vars_list = [(rec_x, rec_seq, rec_pos), (lig_x, lig_seq, lig_pos)]
@@ -379,8 +407,8 @@ class PPIDataset(Dataset):
             'lig_x': lig_x,
             'rec_pos': rec_pos,
             'lig_pos': lig_pos,
-            'ires': ires,
             'position_matrix': position_matrix,
+            'ires': ires,
         }
         
         return {key: value for key, value in output.items()}
@@ -396,6 +424,7 @@ class PPIDataset(Dataset):
         
         x = torch.cat([rec_x, lig_x], dim=0)
         pos = torch.cat([rec_pos, lig_pos], dim=0)
+        seq = rec_seq + lig_seq
 
         use_spatial_crop = random.random() < 0.5
         num_res = asym_id.size(0)
@@ -411,14 +440,17 @@ class PPIDataset(Dataset):
         asym_id = torch.index_select(asym_id, 0, crop_idxs)
         x = torch.index_select(x, 0, crop_idxs)
         pos = torch.index_select(pos, 0, crop_idxs)
+        seq = ''.join([seq[i] for i in crop_idxs.tolist()])
 
         sep = asym_id.tolist().index(1)
         rec_x = x[:sep]
         lig_x = x[sep:]
         rec_pos = pos[:sep]
         lig_pos = pos[sep:]
+        rec_seq = seq[:sep]
+        lig_seq = seq[sep:]
 
-        return rec_x, lig_x, rec_pos, lig_pos, res_id, asym_id
+        return rec_x, lig_x, rec_seq, lig_seq, rec_pos, lig_pos, res_id, asym_id
         
 #----------------------------------------------------------------------------
 # DataModule class
@@ -476,12 +508,14 @@ class PPIDataModule(pl.LightningDataModule):
             shuffle=False,
         )
 
+
 #----------------------------------------------------------------------------
 # Testing
 
 if __name__ == '__main__':
     dataset = PPIDataset(
-        dataset="dips_train_hetero",
+        dataset="ppi3d_train",
+        crop_size=100,
     )
     print(len(dataset))
     print(dataset[0])

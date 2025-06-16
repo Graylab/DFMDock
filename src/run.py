@@ -5,7 +5,7 @@ from omegaconf import DictConfig
 
 os.environ["WANDB__SERVICE_WAIT"] = "300"
 
-@hydra.main(version_base="1.1", config_path="../configs/", config_name="config.yaml")
+@hydra.main(version_base="1.1", config_path="/scratch4/jgray21/lchu11/graylab_repos/DFMDock/configs/", config_name="config.yaml")
 def main(config: DictConfig):
     torch.manual_seed(0)
 

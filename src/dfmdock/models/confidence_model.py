@@ -21,7 +21,7 @@ from dfmdock.datasets.ppi_mlsb_dataset import PPIDataset
 #----------------------------------------------------------------------------
 # Main wrapper for training the model
 
-class Rank_Model(pl.LightningModule):
+class Confidence_Model(pl.LightningModule):
     def __init__(
         self,
         model,
@@ -69,7 +69,7 @@ class Rank_Model(pl.LightningModule):
         
         # net
         module = importlib.import_module(f"dfmdock.models.{model.file_name}")
-        self.net = module.Rank_Net(model)
+        self.net = module.Confidence_Net(model)
     
     def forward(self, batch):
         outputs = self.net(batch, predict=True)
@@ -330,7 +330,7 @@ def get_rmsd(pred, label):
 #----------------------------------------------------------------------------
 # Testing run
 
-@hydra.main(version_base=None, config_path="/scratch4/jgray21/lchu11/graylab_repos/DFMDock/configs/model", config_name="rank_model.yaml")
+@hydra.main(version_base=None, config_path="/scratch4/jgray21/lchu11/graylab_repos/DFMDock/configs/model", config_name="confidence_model.yaml")
 def main(conf: DictConfig):
     dataset = PPIDataset(
         dataset='dips_train_hetero',
@@ -343,7 +343,7 @@ def main(conf: DictConfig):
     #load dataset
     dataloader = DataLoader(subset)
     
-    model = Rank_Model(
+    model = Confidence_Model(
         model=conf.model, 
         diffuser=conf.diffuser,
         experiment=conf.experiment

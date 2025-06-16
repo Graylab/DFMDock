@@ -206,15 +206,15 @@ class Sampler:
             _id = batch['id'][0]
             rec_seq = batch['rec_seq'][0]
             lig_seq = batch['lig_seq'][0]
-            rec_onehot = batch['rec_onehot'].to(self.device).squeeze(0)
-            lig_onehot = batch['lig_onehot'].to(self.device).squeeze(0)
+            rec_x = batch['rec_x'].to(self.device).squeeze(0)
+            lig_x = batch['lig_x'].to(self.device).squeeze(0)
             rec_pos = batch['rec_pos'].to(self.device).squeeze(0)
             lig_pos = batch['lig_pos'].to(self.device).squeeze(0)
             position_matrix = batch['position_matrix'].to(self.device).squeeze(0)
-            rec_x = self.model.get_esm_rep(rec_seq)
-            lig_x = self.model.get_esm_rep(lig_seq)
-            rec_x = torch.cat([rec_x, rec_onehot], dim=-1).to(self.device)
-            lig_x = torch.cat([lig_x, lig_onehot], dim=-1).to(self.device)
+            rec_esm = self.model.get_esm_rep(rec_seq)
+            lig_esm = self.model.get_esm_rep(lig_seq)
+            rec_x = torch.cat([rec_x, rec_esm], dim=-1).to(self.device)
+            lig_x = torch.cat([lig_x, lig_esm], dim=-1).to(self.device)
 
             batch = {
                 "rec_x": rec_x,

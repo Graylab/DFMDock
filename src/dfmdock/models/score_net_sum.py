@@ -26,6 +26,15 @@ class ModelConfig:
 #----------------------------------------------------------------------------
 # Helper functions
 
+def get_rbf(D):
+    device = D.device
+    D_min, D_max, D_count = 2., 22., 16
+    D_mu = torch.linspace(D_min, D_max, D_count, device=device)
+    D_mu = D_mu.view([1,1,-1])
+    D_sigma = (D_max - D_min) / D_count
+    RBF = torch.exp(-((D - D_mu) / D_sigma)**2)
+    return RBF
+
 def get_spatial_matrix(coord):
     dist, omega, theta, phi = get_coords6d(coord)
 
@@ -311,11 +320,10 @@ class Score_Net(nn.Module):
         self.cut_off = conf.cut_off
         
         # single init embedding
-        self.single_embed = nn.Linear(lm_embed_dim, node_dim, bias=False)
+        self.single_embed = nn.Linear(lm_embed_dim + 2, node_dim, bias=False)
 
         # pair init embedding
-        self.spatial_embed = nn.Linear(spatial_embed_dim, edge_dim, bias=False)
-        self.positional_embed = nn.Linear(positional_embed_dim, edge_dim, bias=False)
+        self.pair_embed = nn.Linear(spatial_embed_dim + positional_embed_dim, edge_dim, bias=False)
 
         # denoising score network
         self.network = EGNN(
@@ -332,20 +340,14 @@ class Score_Net(nn.Module):
 
         # energy head
         self.to_energy = nn.Sequential(
-            nn.Linear(2*node_dim, node_dim, bias=False),
+            nn.Linear(2*node_dim + 16 + 3, node_dim, bias=False),
             nn.LayerNorm(node_dim),
             nn.SiLU(),
             nn.Linear(node_dim, 1, bias=False),
         )
 
         # interface residue head
-        self.to_ires = nn.Sequential(
-            nn.Linear(node_dim, 2*node_dim),
-            nn.SiLU(),
-            nn.Linear(2*node_dim, 2*node_dim),
-            nn.SiLU(),
-            nn.Linear(2*node_dim, 1),
-        )
+        self.to_ires = nn.Linear(node_dim, 1, bias=False)
 
         # timestep embedding
         self.t_embed = nn.Sequential(
@@ -389,6 +391,7 @@ class Score_Net(nn.Module):
         lig_x = batch["lig_x"] 
         rec_pos = batch["rec_pos"] 
         lig_pos = batch["lig_pos"] 
+        t = batch["t"]
         position_matrix = batch["position_matrix"]
 
         # move to center
@@ -396,20 +399,24 @@ class Score_Net(nn.Module):
         rec_pos = rec_pos - center
         lig_pos = lig_pos - center
 
+        # get ca distance matrix 
+        v_ij = lig_pos[None, :, 1, :] - rec_pos[:, None, 1, :]
+        d_ij = torch.norm(v_ij, dim=-1, keepdim=True)
+        r_ij = F.normalize(v_ij, dim=-1)
+        rbf = get_rbf(d_ij)
+
         # get the current complex pose
         lig_pos.requires_grad_()
         pos = torch.cat([rec_pos, lig_pos], dim=0)
 
-        # get ca distance matrix 
-        D = torch.norm((rec_pos[:, None, 1, :] - lig_pos[None, :, 1, :]), dim=-1)
-
         # node feature embedding
+        chain_flag = F.one_hot(torch.tensor([0]*rec_x.size(0) + [1]*lig_x.size(0), device=rec_x.device), num_classes=2).float()
         x = torch.cat([rec_x, lig_x], dim=0)
-        node = self.single_embed(x)
+        node = self.single_embed(torch.cat([x, chain_flag], dim=-1)) 
 
         # edge feature embedding
         spatial_matrix = get_spatial_matrix(pos)
-        edge = self.spatial_embed(spatial_matrix) + self.positional_embed(position_matrix)
+        edge = self.pair_embed(torch.cat([spatial_matrix, position_matrix], dim=-1)) 
 
         # sample edge_index and get edge_attr
         edge_index, edge_attr = get_knn_and_sample_graph(pos[..., 1, :], edge)
@@ -419,17 +426,23 @@ class Score_Net(nn.Module):
         lig_mask[rec_x.size(0):] = 1.0
 
         # main network 
-        node_out, pos_out, _ = self.network(node, pos[..., 1, :], edge_index, edge_attr, lig_mask)
+        node_out, pos_out, _ = self.network(node, pos[..., 1, :], edge_index, edge_attr, lig_mask) 
 
         # interface residue
         ires = self.to_ires(node_out)
 
+        # pair
+        h_i = repeat(node_out[:rec_pos.size(0)], 'n h -> n m h', m=lig_pos.size(0))
+        h_j = repeat(node_out[rec_pos.size(0):], 'm h -> n m h', n=rec_pos.size(0))
+        h_ij = torch.cat([h_i, h_j, rbf, r_ij], dim=-1)
+
+        # weights
+        sigma = 10.0
+        weights = torch.exp(-(d_ij ** 2) / (sigma ** 2))
+
         # energy
-        h_rec = repeat(node_out[:rec_pos.size(0)], 'n h -> n m h', m=lig_pos.size(0))
-        h_lig = repeat(node_out[rec_pos.size(0):], 'm h -> n m h', n=rec_pos.size(0))
-        energy = self.to_energy(torch.cat([h_rec, h_lig], dim=-1)).squeeze(-1)
-        mask_2D = (D < self.cut_off).float()
-        energy = (energy * mask_2D).sum() 
+        e_ij = self.to_energy(h_ij)
+        energy = (e_ij * weights).sum()
 
         if return_energy:
             return energy
@@ -437,7 +450,7 @@ class Score_Net(nn.Module):
         # force
         lig_pos_curr = pos_out[rec_pos.size(0):] 
         r = lig_pos[..., 1, :].detach()
-        f = lig_pos_curr - r
+        f = lig_pos_curr - r 
 
         # translation
         tr_pred = f.sum(dim=0, keepdim=True)
@@ -446,7 +459,7 @@ class Score_Net(nn.Module):
         rot_pred = torch.cross(r, f, dim=-1).sum(dim=0, keepdim=True)
 
         # scale
-        t = self.t_embed(batch["t"])
+        t = self.t_embed(t)
         tr_norm = torch.linalg.vector_norm(tr_pred, keepdim=True)
         tr_score = tr_pred / (tr_norm + 1e-6) * self.tr_scale(torch.cat([tr_norm, t], dim=-1))
         rot_norm = torch.linalg.vector_norm(rot_pred, keepdim=True)
@@ -474,7 +487,7 @@ class Score_Net(nn.Module):
             allow_unused=True,
         )[0]
 
-        dedx = -dedx[..., 1, :] # F / kT
+        dedx = -dedx[..., 1, :] 
         
         outputs = {
             "tr_score": tr_score,

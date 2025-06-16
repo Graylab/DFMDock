@@ -8,9 +8,9 @@ def get_dockq(model, native):
     native_lig = native[1].squeeze()
     
     # calc metrics
-    i_rmsd = get_i_rmsd(model_rec, model_lig, native_rec, native_lig)
-    l_rmsd = get_l_rmsd(model_rec, model_lig, native_rec, native_lig)
-    fnat = get_fnat(model_rec, model_lig, native_rec, native_lig)
+    i_rmsd = get_i_rmsd(model_rec, model_lig, native_rec, native_lig).nan_to_num()
+    l_rmsd = get_l_rmsd(model_rec, model_lig, native_rec, native_lig).nan_to_num()
+    fnat = get_fnat(model_rec, model_lig, native_rec, native_lig).nan_to_num()
     i_rmsd_scaled = 1.0 / (1.0 + (i_rmsd/1.5)**2)
     l_rmsd_scaled = 1.0 / (1.0 + (l_rmsd/8.5)**2)
     dockq = (fnat + i_rmsd_scaled + l_rmsd_scaled) / 3
