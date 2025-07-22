@@ -145,13 +145,13 @@ def get_native(pdb_path):
             residue_mask = ((structure.res_id == res_id) & (structure.chain_id == chain_id))
             residue_atoms = structure[residue_mask]
         
-        # Get atom names for this residue
-        residue_atom_names = set(residue_atoms.atom_name)
-        
-        # Check if all backbone atoms are present
-        if backbone_atoms.issubset(residue_atom_names):
-            # If backbone atoms are present, mark this residue as valid
-            valid_atoms_mask[residue_mask] = True
+            # Get atom names for this residue
+            residue_atom_names = set(residue_atoms.atom_name)
+            
+            # Check if all backbone atoms are present
+            if backbone_atoms.issubset(residue_atom_names):
+                # If backbone atoms are present, mark this residue as valid
+                valid_atoms_mask[residue_mask] = True
 
     # Apply the mask to filter the structure
     filtered_structure = structure[valid_atoms_mask]
