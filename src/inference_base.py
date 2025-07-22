@@ -139,10 +139,11 @@ def get_native(pdb_path):
     valid_atoms_mask = np.zeros(len(structure), dtype=bool)
 
     # Iterate over unique residues
-    for res_id in set(structure.res_id):
-        # Create a mask for atoms in the current residue
-        residue_mask = (structure.res_id == res_id)
-        residue_atoms = structure[residue_mask]
+    for chain_id in set(structure.chain_id):
+        for res_id in set(structure.res_id):
+            # Create a mask for atoms in the current residue
+            residue_mask = ((structure.res_id == res_id) & (structure.chain_id == chain_id))
+            residue_atoms = structure[residue_mask]
         
         # Get atom names for this residue
         residue_atom_names = set(residue_atoms.atom_name)
